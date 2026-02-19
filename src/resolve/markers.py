@@ -108,8 +108,21 @@ def import_markers(
 
     # Load analysis data
     analysis = load_analysis(json_path)
-    source_fps = analysis.get("video_info", {}).get("fps", timeline_fps)
     events = analysis.get("events", [])
+    mode = analysis.get("mode", "single_video")
+
+    # In timeline mode, events already have timeline-relative frame numbers.
+    # In single_video mode, we may need to adjust for FPS differences.
+    if mode == "timeline":
+        source_fps = analysis.get("timeline", {}).get("fps", timeline_fps)
+        source_tl_name = analysis.get("timeline", {}).get("name", "")
+        if source_tl_name and source_tl_name != timeline_name:
+            logger.warning(
+                "Analysis was for timeline '%s' but importing into '%s'",
+                source_tl_name, timeline_name,
+            )
+    else:
+        source_fps = analysis.get("video_info", {}).get("fps", timeline_fps)
 
     if clear_existing:
         _clear_markers(timeline)
