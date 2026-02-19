@@ -2,7 +2,13 @@
 
 ## Executive Summary
 
-This document plans a DaVinci Resolve plugin system that analyzes basketball game footage to detect interesting plays. The recommended architecture is a **hybrid approach**: a Python-based analysis engine for video/audio processing combined with Resolve's scripting API for timeline integration. An optional OpenFX (OFX) plugin can provide real-time visual overlays.
+This document plans a DaVinci Resolve plugin system that analyzes basketball game footage to detect interesting plays. The architecture uses **Option B: Analyze Outside, Import Results** — a standalone Python analysis engine runs independently of Resolve, produces a JSON file of timestamped events, and a separate lightweight Resolve script reads that JSON to annotate the timeline with color-coded markers.
+
+This two-step approach means:
+- The analysis engine has **zero dependency on DaVinci Resolve** — it can run on any machine, even a headless GPU server
+- Results are portable: the JSON interchange format could be adapted for other NLEs in the future
+- Development and debugging are simpler since each piece works independently
+- A convenience wrapper to launch analysis from inside Resolve can be added later (Option A/C)
 
 ---
 
@@ -83,53 +89,66 @@ We must run our own ML models externally.
 
 ---
 
-## 2. Recommended Architecture: Hybrid Approach
+## 2. Architecture: Analyze Outside, Import Results (Option B)
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   DaVinci Resolve                        │
-│                                                          │
-│  ┌──────────────┐    ┌─────────────────────────────┐    │
-│  │ Scripting API │    │ OFX Plugin (optional)       │    │
-│  │ (Python)      │    │ Visual overlays on timeline │    │
-│  │               │    │ (tracking boxes, arcs, etc.)│    │
-│  │ • Export media│    └─────────────────────────────┘    │
-│  │ • Add markers │                                       │
-│  │ • Edit timeline│                                      │
-│  └──────┬───────┘                                        │
-│         │                                                │
-└─────────┼────────────────────────────────────────────────┘
-          │  file I/O + API calls
-          │
-┌─────────▼────────────────────────────────────────────────┐
-│            Analysis Engine (Python)                        │
-│                                                            │
-│  ┌────────────┐ ┌────────────┐ ┌───────────────────────┐ │
-│  │ Video       │ │ Audio      │ │ Event Classification  │ │
-│  │ Analysis    │ │ Analysis   │ │                       │ │
-│  │             │ │            │ │ • Made shots          │ │
-│  │ • YOLO      │ │ • librosa  │ │ • Fast breaks        │ │
-│  │ • OpenCV    │ │ • mel-spec │ │ • Dunks / alley-oops │ │
-│  │ • MediaPipe │ │ • MFCC     │ │ • Blocks             │ │
-│  │ • PyScene   │ │ • crowd    │ │ • 3-pointers         │ │
-│  │   Detect    │ │   scoring  │ │ • Buzzer beaters     │ │
-│  └────────────┘ └────────────┘ └───────────────────────┘ │
-│                                                            │
-│  Output: JSON with timestamped events + confidence scores  │
-└────────────────────────────────────────────────────────────┘
+  Step 1: Standalone Analysis (no Resolve needed)
+  ================================================
+
+  $ basketball-analyze game_footage.mp4 -o game_analysis.json
+
+  ┌────────────────────────────────────────────────────────┐
+  │        Analysis Engine (Python CLI)                     │
+  │                                                         │
+  │  ┌────────────┐ ┌────────────┐ ┌──────────────────┐   │
+  │  │ Video       │ │ Audio      │ │ Event            │   │
+  │  │ Analysis    │ │ Analysis   │ │ Classification   │   │
+  │  │             │ │            │ │                  │   │
+  │  │ • YOLO      │ │ • librosa  │ │ • Made shots     │   │
+  │  │ • OpenCV    │ │ • mel-spec │ │ • Dunks          │   │
+  │  │ • PyScene   │ │ • crowd    │ │ • Fast breaks    │   │
+  │  │   Detect    │ │   scoring  │ │ • 3-pointers     │   │
+  │  │ • Kalman    │ │ • whistle  │ │ • Blocks         │   │
+  │  │   tracking  │ │   detect   │ │ • Crowd moments  │   │
+  │  └────────────┘ └────────────┘ └──────────────────┘   │
+  │                                                         │
+  │  Output: game_analysis.json                             │
+  └────────────────────────────────────────────────────────┘
+
+  Step 2: Import into Resolve
+  ===========================
+
+  $ python -m src.resolve.markers game_analysis.json
+
+  ┌────────────────────────────────────────────────────────┐
+  │             DaVinci Resolve                              │
+  │                                                          │
+  │  ┌──────────────────────────────────────────────────┐   │
+  │  │ Import Script (Python, Resolve Scripting API)     │   │
+  │  │                                                    │   │
+  │  │ • Reads game_analysis.json                         │   │
+  │  │ • Creates color-coded markers on active timeline   │   │
+  │  │ • Optionally generates highlights sub-timeline     │   │
+  │  └──────────────────────────────────────────────────┘   │
+  │                                                          │
+  │  Timeline: [--B--G---R----Y---B------G--C----B---]      │
+  │             shot 3pt dunk fast shot  3pt crowd shot      │
+  └────────────────────────────────────────────────────────┘
 ```
 
-### Why Hybrid?
+### Why Option B (Analyze Outside)?
 
-| Concern | Hybrid Approach |
-|---------|-----------------|
-| Frame access | Render to disk, then process with full Python ML stack |
-| Audio access | Extract audio track, analyze with librosa |
-| ML models | Full PyTorch/YOLO/MediaPipe ecosystem available |
-| Timeline integration | Scripting API adds markers, creates sub-timelines |
-| Real-time overlays | Optional OFX plugin reads analysis JSON, draws overlays |
-| Development speed | Python for analysis; C++ only if overlays needed |
-| Cross-platform | Python + Resolve scripting works on Linux, macOS, Windows |
+| Concern | This Approach |
+|---------|---------------|
+| Resolve dependency | Analysis engine has zero Resolve dependency |
+| Frame access | Process video files directly with OpenCV + YOLO |
+| Audio access | Extract audio via FFmpeg, analyze with librosa |
+| ML models | Full PyTorch/YOLO/MediaPipe ecosystem |
+| Portability | JSON output could be adapted for Premiere, FCPX, etc. |
+| Development speed | Pure Python, easy to test without Resolve |
+| Batch processing | Can run on a headless GPU server |
+| Cross-platform | Works on Linux, macOS, Windows |
+| Resolve integration | Separate lightweight import script reads JSON → markers |
 
 ---
 
@@ -258,13 +277,15 @@ Combine video and audio signals to classify basketball events:
 
 ### 4.1 Workflow
 
-1. **User opens project** in DaVinci Resolve with basketball footage on timeline
-2. **User runs analysis script** (from Resolve's Workspace > Scripts menu or external CLI)
-3. **Script exports media:**
-   - Renders timeline or selected clips to intermediate format (e.g., ProRes or H.264)
-   - Extracts audio to WAV via FFmpeg
-4. **Analysis engine processes** video and audio (can run on GPU for YOLO acceleration)
-5. **Script reads results JSON** and adds color-coded markers to timeline:
+**Step 1 — Analyze (outside Resolve, or on any machine):**
+1. User runs `basketball-analyze game_footage.mp4` from the command line
+2. Analysis engine processes video (YOLO, ball tracking, scene detection) and audio (crowd excitement, whistles)
+3. Engine writes `game_footage_analysis.json` with all detected events
+
+**Step 2 — Import (inside Resolve):**
+1. User opens their project in DaVinci Resolve with footage on a timeline
+2. User runs `python -m src.resolve.markers game_footage_analysis.json`
+3. Script reads the JSON and adds color-coded markers to the active timeline:
 
 | Marker Color | Event Type |
 |-------------|------------|
@@ -276,17 +297,27 @@ Combine video and audio signals to classify basketball events:
 | Pink | Buzzer beater |
 | Cyan | High crowd excitement (unclassified) |
 
-6. **Optionally auto-generates** a "Highlights" sub-timeline containing only marked events with configurable padding
+4. Optionally, the import script can auto-generate a "Highlights" sub-timeline containing only the marked events with configurable padding
 
-### 4.2 Script Structure
+### 4.2 Two-Part Script Structure
 
 ```
-resolve_integration/
-├── basketball_analyzer.py      # Main entry point / orchestrator
-├── resolve_export.py           # Media export via Resolve scripting API
-├── resolve_markers.py          # Marker creation and timeline manipulation
-├── config.py                   # User-configurable thresholds and settings
-└── cli.py                      # Command-line interface for standalone use
+src/
+├── analysis/                    # Part 1: Standalone analysis (no Resolve needed)
+│   ├── video_analyzer.py        # Pipeline orchestrator
+│   ├── audio_analyzer.py        # Crowd excitement + whistle detection
+│   ├── object_detector.py       # YOLO-based detection
+│   ├── ball_tracker.py          # Kalman filter tracking + shot detection
+│   ├── player_tracker.py        # DeepSORT + team classification
+│   ├── scene_detector.py        # PySceneDetect wrapper
+│   └── event_classifier.py      # Multi-modal fusion
+│
+├── resolve/                     # Part 2: Resolve import (needs Resolve running)
+│   ├── markers.py               # JSON → timeline markers
+│   └── highlights.py            # Auto-generate highlight timeline
+│
+├── config.py                    # Shared configuration
+└── cli.py                       # CLI entry point for analysis
 ```
 
 ### 4.3 Configuration Options
@@ -437,32 +468,37 @@ Resolve-basketball-analysis/
 
 ## 8. Development Phases
 
-### Phase 1: Foundation
-- Set up Python project structure, dependencies, and configuration
-- Implement scene/shot detection with PySceneDetect
-- Implement audio extraction and basic crowd excitement scoring with librosa
-- Build Resolve scripting integration: export media, add markers
-- End-to-end test: analyze sample footage → markers appear on Resolve timeline
+### Phase 1: Standalone Analysis Engine (no Resolve needed)
+- [x] Set up Python project structure, dependencies, and configuration
+- [x] Implement scene/shot detection with PySceneDetect
+- [x] Implement audio extraction and crowd excitement scoring with librosa
+- [x] Implement YOLO object detection for ball, hoop, players
+- [x] Implement Kalman filter ball tracking + shot detection
+- [x] Implement DeepSORT player tracking with team classification
+- [x] Build multi-modal event classifier
+- [x] Build CLI entry point (`basketball-analyze` command)
+- [ ] Test end-to-end with sample basketball footage
+- [ ] Fine-tune YOLO on basketball-specific dataset (Roboflow)
 
-### Phase 2: Object Detection and Tracking
-- Integrate YOLOv8 for ball, hoop, and player detection
-- Implement Kalman filter ball tracking
-- Implement made-shot detection (ball through hoop)
-- Add DeepSORT player tracking with team classification via jersey color
-- Test with real basketball footage
+### Phase 2: Resolve Import Script
+- [x] Build marker import script (JSON → Resolve timeline markers)
+- [x] Build highlight timeline generator
+- [ ] Test with DaVinci Resolve Studio
+- [ ] Handle FPS mismatch between source video and timeline
+- [ ] Add ability to filter by event type during import
 
-### Phase 3: Event Classification
-- Build multi-modal event classifier combining video + audio signals
-- Implement detection for: made shots, 3-pointers, dunks, fast breaks, blocks
-- Tune confidence thresholds on sample footage
-- Add auto-highlight timeline generation
+### Phase 3: Refinement and Tuning
+- [ ] Tune confidence thresholds on real game footage
+- [ ] Improve audio analysis with MFCC-based commentary excitement detection
+- [ ] Add more event types: dunks, fast breaks, blocks, buzzer beaters
+- [ ] Performance optimization (GPU batching, frame skipping strategies)
 
-### Phase 4: Polish and Optional Features
-- Pose estimation for shooting form analysis
-- Buzzer beater detection (audio buzzer + game clock heuristics)
-- OFX overlay plugin for real-time visualization (if desired)
-- Performance optimization (GPU batching, frame skipping strategies)
-- Documentation and user guide
+### Phase 4: Optional Enhancements
+- [ ] Pose estimation for shooting form analysis (MediaPipe)
+- [ ] In-Resolve launcher script (Option A convenience wrapper)
+- [ ] OFX overlay plugin for real-time tracking visualization
+- [ ] EDL/XML export for NLEs other than Resolve
+- [ ] Web UI for reviewing analysis results before import
 
 ---
 
