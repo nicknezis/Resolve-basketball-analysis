@@ -16,16 +16,18 @@ from pathlib import Path
 
 import cv2
 
+from src.analysis.color import FrameLUT
 from src.analysis.audio_analyzer import (
     analyze_audio,
     analyze_crowd_excitement,
     detect_whistles,
     extract_audio,
 )
-from src.analysis.ball_tracker import BallTracker
+from src.analysis.ball_tracker import BallTracker, HoopObservation
 from src.analysis.event_classifier import EventClassifier, GameEvent
 from src.analysis.object_detector import ObjectDetector
 from src.analysis.player_tracker import PlayerTracker
+from src.analysis.preview import ClipReview, FramePreview
 from src.analysis.scene_detector import Scene, detect_scenes
 from src.config import AnalysisConfig
 
@@ -67,7 +69,27 @@ def analyze_video(
         video_path.name, fps, total_frames, width, height,
     )
 
-    scenes, audio_events, game_events = _run_pipeline(video_path, fps, config)
+    scenes, audio_events, game_events, shot_events, all_detections, \
+        player_tracker, ball_tracker = _run_pipeline(video_path, fps, total_frames, config)
+
+    # Post-analysis review
+    review_kwargs = dict(
+        video_path=str(video_path),
+        start_frame=0,
+        end_frame=total_frames,
+        all_detections=all_detections,
+        shot_events=shot_events,
+        game_events=game_events,
+        player_tracks=player_tracker.get_tracked_players() if player_tracker else {},
+        ball_positions=ball_tracker._positions,
+        fps=fps,
+        input_lut=config.video.input_lut,
+    )
+    if config.review_export:
+        config.review_export.mkdir(parents=True, exist_ok=True)
+        ClipReview().export(export_path=config.review_export / "review.mp4", **review_kwargs)
+    if config.review:
+        ClipReview().replay(**review_kwargs)
 
     return _build_single_output(
         video_path, fps, total_frames, width, height, scenes, game_events,
@@ -81,7 +103,8 @@ def analyze_video(
 def analyze_timeline(
     timeline_json_path: Path,
     config: AnalysisConfig | None = None,
-    clip_index: int | None = None,
+    clip_indices: list[int] | None = None,
+    output_path: Path | None = None,
 ) -> dict:
     """Run analysis on a Resolve timeline export, processing each clip.
 
@@ -97,8 +120,10 @@ def analyze_timeline(
         timeline_json_path: Path to the timeline export JSON from
             ``python -m src.resolve.export``.
         config: Analysis configuration. Uses defaults if None.
-        clip_index: If provided, only process this clip (0-based index
-            across all tracks). Useful for testing with a single clip.
+        clip_indices: If provided, only process clips at these indices
+            (0-based across all tracks). Supports multiple indices.
+        output_path: If provided, per-clip JSON files are written to
+            a ``clips/`` subdirectory alongside this path.
 
     Returns:
         Analysis results dict with timeline-relative frame positions.
@@ -122,22 +147,37 @@ def analyze_timeline(
         for clip in track.get("clips", []):
             all_clips.append((track_idx, clip))
 
-    if clip_index is not None:
-        if clip_index < 0 or clip_index >= len(all_clips):
-            logger.error(
-                "Clip index %d out of range (timeline has %d clips)",
-                clip_index, len(all_clips),
-            )
-            return {"error": f"Clip index {clip_index} out of range (0-{len(all_clips) - 1})"}
-        all_clips = [all_clips[clip_index]]
-        logger.info("Processing only clip %d of %d", clip_index, len(all_clips))
+    total_clip_count = len(all_clips)
+
+    if clip_indices is not None:
+        selected = []
+        for idx in clip_indices:
+            if idx < 0 or idx >= total_clip_count:
+                logger.warning(
+                    "Clip index %d out of range (timeline has %d clips), skipping",
+                    idx, total_clip_count,
+                )
+            else:
+                selected.append((idx, all_clips[idx]))
+        if not selected:
+            return {"error": f"No valid clip indices in {clip_indices} (0-{total_clip_count - 1})"}
+        clips_to_process = selected
+        logger.info("Processing %d of %d clips: %s", len(selected), total_clip_count, clip_indices)
+    else:
+        clips_to_process = list(enumerate(all_clips))
+
+    # Set up per-clip output directory
+    clips_dir = None
+    if output_path is not None:
+        clips_dir = Path(output_path).parent / "clips"
+        clips_dir.mkdir(parents=True, exist_ok=True)
 
     all_events: list[GameEvent] = []
     all_scenes: list[Scene] = []
     clips_analyzed = 0
     clips_skipped = 0
 
-    for track_idx, clip in all_clips:
+    for clip_global_idx, (track_idx, clip) in clips_to_process:
         clip_name = clip.get("clip_name", "unknown")
         analysis_path = clip.get("analysis_path", "") or clip.get("file_path", "")
 
@@ -150,18 +190,33 @@ def analyze_timeline(
             continue
 
         logger.info(
-            "=== Analyzing clip '%s' (track %d) ===", clip_name, track_idx,
+            "=== Analyzing clip '%s' (track %d, index %d) ===",
+            clip_name, track_idx, clip_global_idx,
         )
 
         clip_events, clip_scenes = _analyze_clip(
             clip_info=clip,
             timeline_fps=tl_fps,
             config=config,
+            clip_index=clip_global_idx,
         )
 
         all_events.extend(clip_events)
         all_scenes.extend(clip_scenes)
         clips_analyzed += 1
+
+        # Write per-clip JSON immediately
+        if clips_dir is not None:
+            clip_output = _build_clip_output(
+                clip_info=clip,
+                clip_index=clip_global_idx,
+                events=clip_events,
+                scenes=clip_scenes,
+                timeline_data=timeline_data,
+            )
+            clip_path = clips_dir / f"clip_{clip_global_idx}.json"
+            save_results(clip_output, clip_path)
+            logger.info("Per-clip results saved to %s", clip_path)
 
     # Sort all events by timeline position
     all_events.sort(key=lambda e: e.start_sec)
@@ -185,6 +240,7 @@ def _analyze_clip(
     clip_info: dict,
     timeline_fps: float,
     config: AnalysisConfig,
+    clip_index: int = 0,
 ) -> tuple[list[GameEvent], list[Scene]]:
     """Analyze a single clip's source range and map results to timeline frames.
 
@@ -192,6 +248,7 @@ def _analyze_clip(
         clip_info: Clip dict from the timeline export JSON.
         timeline_fps: The timeline's frame rate.
         config: Analysis settings.
+        clip_index: Global clip index (used for review export filenames).
 
     Returns:
         Tuple of (events mapped to timeline frames, scenes mapped to timeline).
@@ -208,20 +265,28 @@ def _analyze_clip(
     )
 
     # --- Video analysis on the source range ---
-    detector = ObjectDetector(config.video, device=config.device)
+    lut = FrameLUT(config.video.input_lut)
+    detector = ObjectDetector(config.video, device=config.device, detect_players=config.tracking.enable_player_tracking)
     ball_tracker = BallTracker(config.tracking)
-    player_tracker = PlayerTracker(config.tracking, device=config.device)
+    player_tracker = PlayerTracker(config.tracking, device=config.device) if config.tracking.enable_player_tracking else None
 
     cap = cv2.VideoCapture(str(analysis_path))
     if not cap.isOpened():
         logger.error("  Cannot open media file: %s", analysis_path)
         return [], []
 
+    total_source_frames = source_end - source_start
+
     # Seek to source start frame
     cap.set(cv2.CAP_PROP_POS_FRAMES, source_start)
 
     all_detections = []
+    hoop_observations: list[HoopObservation] = []
     frame_idx = source_start
+
+    # Set up live preview if requested
+    frame_preview = FramePreview() if config.preview else None
+    preview_active = config.preview
 
     while frame_idx < source_end:
         ret, frame = cap.read()
@@ -230,6 +295,7 @@ def _analyze_clip(
 
         relative_frame = frame_idx - source_start
         if relative_frame % config.video.frame_skip == 0:
+            frame = lut.apply(frame)
             h, w = frame.shape[:2]
             if max(h, w) > config.video.max_resolution:
                 scale = config.video.max_resolution / max(h, w)
@@ -240,16 +306,45 @@ def _analyze_clip(
             fd = detector.detect_frame(frame_resized, frame_idx)
             all_detections.append(fd)
 
+            # Incremental ball tracking
+            ball_pos = ball_tracker.update(fd)
+
+            # Collect hoop observations with bounding boxes
+            if fd.hoops:
+                best_hoop = max(fd.hoops, key=lambda d: d.confidence)
+                hoop_observations.append(HoopObservation(
+                    frame_idx=frame_idx,
+                    bbox=best_hoop.bbox,
+                    center=best_hoop.center,
+                    confidence=best_hoop.confidence,
+                ))
+
             # Player tracking needs the original frame for color sampling
-            player_tracker.update(frame, fd)
+            tracking = player_tracker.update(frame, fd) if player_tracker else None
+
+            # Live preview rendering
+            if preview_active and frame_preview is not None:
+                preview_active = frame_preview.render(
+                    frame=frame_resized,
+                    detections=fd,
+                    ball_position=ball_pos,
+                    tracking=tracking,
+                    frame_idx=frame_idx,
+                    total_frames=source_end,
+                )
 
         frame_idx += 1
 
     cap.release()
-    player_tracker.classify_teams()
+    if frame_preview is not None:
+        frame_preview.close()
 
-    # Ball tracking + shot detection
-    shot_events = ball_tracker.detect_shots(all_detections)
+    if player_tracker:
+        player_tracker.classify_teams()
+
+    # Shot detection using incrementally collected data
+    ball_tracker.set_hoop_observations(hoop_observations)
+    shot_events = ball_tracker.find_shots()
 
     # --- Audio analysis on the source range ---
     audio_events = []
@@ -293,6 +388,25 @@ def _analyze_clip(
     # --- Event classification ---
     classifier = EventClassifier(config.events, fps=media_fps)
     game_events = classifier.classify(shot_events, audio_events, scenes)
+
+    # --- Post-analysis review replay (before frame mapping) ---
+    review_kwargs = dict(
+        video_path=str(analysis_path),
+        start_frame=source_start,
+        end_frame=source_end,
+        all_detections=all_detections,
+        shot_events=shot_events,
+        game_events=game_events,
+        player_tracks=player_tracker.get_tracked_players() if player_tracker else {},
+        ball_positions=ball_tracker._positions,
+        fps=media_fps,
+        input_lut=config.video.input_lut,
+    )
+    if config.review_export:
+        config.review_export.mkdir(parents=True, exist_ok=True)
+        ClipReview().export(export_path=config.review_export / f"clip_{clip_index}.mp4", **review_kwargs)
+    if config.review:
+        ClipReview().replay(**review_kwargs)
 
     # --- Map from source frames to timeline frames ---
     fps_ratio = timeline_fps / media_fps if media_fps > 0 else 1.0
@@ -404,6 +518,41 @@ def _build_timeline_output(
     }
 
 
+def _build_clip_output(
+    clip_info: dict,
+    clip_index: int,
+    events: list[GameEvent],
+    scenes: list[Scene],
+    timeline_data: dict,
+) -> dict:
+    """Build output for a single clip within timeline mode."""
+    tl = timeline_data["timeline"]
+    return {
+        "analysis_version": "0.2.0",
+        "mode": "timeline_clip",
+        "clip_index": clip_index,
+        "clip_name": clip_info.get("clip_name", "unknown"),
+        "source_file": clip_info.get("analysis_path") or clip_info.get("file_path", ""),
+        "timeline": {
+            "name": tl["name"],
+            "fps": tl["fps"],
+        },
+        "clip_info": {
+            "source_start_frame": clip_info.get("source_start_frame"),
+            "source_end_frame": clip_info.get("source_end_frame"),
+            "timeline_start_frame": clip_info.get("timeline_start_frame"),
+            "media_fps": clip_info.get("media_fps"),
+        },
+        "scenes": _serialize_scenes(scenes),
+        "events": _serialize_events(events),
+        "summary": {
+            "total_events": len(events),
+            "event_counts": _count_events(events),
+            "total_scenes": len(scenes),
+        },
+    }
+
+
 def _serialize_scenes(scenes: list[Scene]) -> list[dict]:
     return [
         {
@@ -441,42 +590,97 @@ def _count_events(events: list[GameEvent]) -> dict[str, int]:
 
 
 def _run_pipeline(
-    video_path: Path, fps: float, config: AnalysisConfig,
-) -> tuple[list[Scene], list, list[GameEvent]]:
-    """Run the full analysis pipeline on a single video (all frames)."""
+    video_path: Path, fps: float, total_frames: int, config: AnalysisConfig,
+) -> tuple[list[Scene], list, list[GameEvent], list, list, PlayerTracker, BallTracker]:
+    """Run the full analysis pipeline on a single video (all frames).
+
+    Returns (scenes, audio_events, game_events, shot_events,
+             all_detections, player_tracker, ball_tracker).
+    """
     logger.info("=== Phase 1: Scene Detection ===")
     scenes = detect_scenes(video_path, config.scene)
 
     logger.info("=== Phase 2: Audio Analysis ===")
     audio_events = analyze_audio(video_path, config.audio)
 
-    logger.info("=== Phase 3: Object Detection ===")
-    detector = ObjectDetector(config.video, device=config.device)
-    all_detections = detector.detect_video(video_path)
-
-    logger.info("=== Phase 4: Ball Tracking ===")
+    logger.info("=== Phase 3: Object Detection + Tracking ===")
+    detector = ObjectDetector(config.video, device=config.device, detect_players=config.tracking.enable_player_tracking)
     ball_tracker = BallTracker(config.tracking)
-    shot_events = ball_tracker.detect_shots(all_detections)
+    player_tracker = PlayerTracker(config.tracking, device=config.device) if config.tracking.enable_player_tracking else None
 
-    logger.info("=== Phase 5: Player Tracking ===")
-    player_tracker = PlayerTracker(config.tracking, device=config.device)
+    lut = FrameLUT(config.video.input_lut)
+
     cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    all_detections = []
+    hoop_observations: list[HoopObservation] = []
     frame_idx = 0
 
-    for fd in all_detections:
-        while frame_idx < fd.frame_idx:
-            cap.read()
-            frame_idx += 1
+    frame_preview = FramePreview() if config.preview else None
+    preview_active = config.preview
+
+    while True:
         ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % config.video.frame_skip == 0:
+            frame = lut.apply(frame)
+            h, w = frame.shape[:2]
+            if max(h, w) > config.video.max_resolution:
+                scale = config.video.max_resolution / max(h, w)
+                frame_resized = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            else:
+                frame_resized = frame
+
+            fd = detector.detect_frame(frame_resized, frame_idx)
+            all_detections.append(fd)
+
+            # Incremental ball tracking
+            ball_pos = ball_tracker.update(fd)
+
+            # Collect hoop observations with bounding boxes
+            if fd.hoops:
+                best_hoop = max(fd.hoops, key=lambda d: d.confidence)
+                hoop_observations.append(HoopObservation(
+                    frame_idx=frame_idx,
+                    bbox=best_hoop.bbox,
+                    center=best_hoop.center,
+                    confidence=best_hoop.confidence,
+                ))
+
+            # Player tracking
+            tracking = player_tracker.update(frame, fd) if player_tracker else None
+
+            # Live preview
+            if preview_active and frame_preview is not None:
+                preview_active = frame_preview.render(
+                    frame=frame_resized,
+                    detections=fd,
+                    ball_position=ball_pos,
+                    tracking=tracking,
+                    frame_idx=frame_idx,
+                    total_frames=total_frames,
+                )
+
         frame_idx += 1
-        if ret:
-            player_tracker.update(frame, fd)
 
     cap.release()
-    player_tracker.classify_teams()
+    if frame_preview is not None:
+        frame_preview.close()
 
-    logger.info("=== Phase 6: Event Classification ===")
+    if player_tracker:
+        player_tracker.classify_teams()
+
+    logger.info("=== Phase 4: Shot Detection ===")
+    ball_tracker.set_hoop_observations(hoop_observations)
+    shot_events = ball_tracker.find_shots()
+
+    logger.info("=== Phase 5: Event Classification ===")
     classifier = EventClassifier(config.events, fps=fps)
     game_events = classifier.classify(shot_events, audio_events, scenes)
 
-    return scenes, audio_events, game_events
+    return scenes, audio_events, game_events, shot_events, all_detections, \
+        player_tracker, ball_tracker

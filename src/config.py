@@ -1,5 +1,7 @@
 """Configuration and thresholds for basketball video analysis."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -8,10 +10,13 @@ from pathlib import Path
 class VideoConfig:
     """Settings for video analysis pipeline."""
 
-    yolo_model: str = "yolov8m.pt"
+    yolo_model: str = "yolo11m.pt"
     yolo_confidence: float = 0.5
     frame_skip: int = 2  # analyze every Nth frame for speed
     max_resolution: int = 1920  # downscale larger frames for faster inference
+    input_lut: Path | None = None  # path to .cube 3D LUT file (or .zip/.lut containing one)
+    roboflow_model_id: str | None = None  # Roboflow model ID (e.g. "basketball-detection/1")
+    roboflow_confidence: float = 0.5  # confidence threshold for Roboflow hoop model
 
 
 @dataclass
@@ -39,8 +44,11 @@ class TrackingConfig:
     max_ball_gap_frames: int = 10  # max frames to interpolate missing ball
     shot_min_arc_height_px: int = 50  # minimum arc height to count as a shot attempt
     hoop_proximity_px: int = 80  # pixels from hoop center to count as "through hoop"
+    hoop_x_tolerance_ratio: float = 0.3  # horizontal tolerance as fraction of hoop bbox width
+    hoop_entry_y_margin_px: int = 30  # vertical margin above/below hoop top for entry detection
     deepsort_max_age: int = 30
     deepsort_n_init: int = 3
+    enable_player_tracking: bool = True  # set False to skip DeepSORT player tracking
 
 
 @dataclass
@@ -74,6 +82,9 @@ class AnalysisConfig:
     scene: SceneConfig = field(default_factory=SceneConfig)
     output_dir: Path = field(default_factory=lambda: Path("output"))
     device: str = "auto"  # "auto", "cuda", "cpu"
+    preview: bool = False  # per-frame live preview during analysis
+    review: bool = False  # per-clip replay with full results after analysis
+    review_export: Path | None = None  # directory to save review replay videos
 
 
 # Marker color mapping used by the Resolve import script

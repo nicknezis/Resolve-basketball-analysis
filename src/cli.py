@@ -8,7 +8,30 @@ import sys
 from pathlib import Path
 
 from src.analysis.video_analyzer import analyze_timeline, analyze_video, save_results
-from src.config import AnalysisConfig, AudioConfig, EventConfig, VideoConfig
+from src.config import AnalysisConfig, AudioConfig, EventConfig, TrackingConfig, VideoConfig
+
+
+def _parse_clip_indices(clip_str: str) -> list[int]:
+    """Parse a clip index specification into a sorted deduplicated list.
+
+    Supports single indices, comma-separated lists, and ranges:
+      "3"       -> [3]
+      "0,2,5"   -> [0, 2, 5]
+      "1-4"     -> [1, 2, 3, 4]
+      "0,3-5,8" -> [0, 3, 4, 5, 8]
+    """
+    indices: set[int] = set()
+    for part in clip_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            start, end = int(start_str.strip()), int(end_str.strip())
+            if end < start:
+                raise ValueError(f"Invalid range: {part}")
+            indices.update(range(start, end + 1))
+        else:
+            indices.add(int(part))
+    return sorted(indices)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,8 +67,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--yolo-model",
-        default="yolov8m.pt",
-        help="YOLO model file or name (default: yolov8m.pt)",
+        default="yolo11m.pt",
+        help="YOLO model file or name (default: yolo11m.pt)",
     )
     parser.add_argument(
         "--yolo-confidence",
@@ -73,17 +96,61 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--clip",
-        type=int,
+        type=str,
         default=None,
-        metavar="N",
-        help="In timeline mode, process only the Nth clip (0-based index "
-        "across all tracks). Useful for testing a single clip.",
+        metavar="SPEC",
+        help="In timeline mode, process only the specified clips (0-based). "
+        "Supports: single (3), list (0,2,5), range (1-4), mixed (0,3-5,8).",
+    )
+    parser.add_argument(
+        "--input-lut",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to a .cube 3D LUT file (or .zip/.lut archive containing one) "
+        "for converting log footage to Rec.709. Example: s-gamut3.cine-slog3.lut",
+    )
+    parser.add_argument(
+        "--roboflow-model",
+        default=None,
+        metavar="MODEL_ID",
+        help="Roboflow model ID for hoop detection (e.g. basketball-detection/1). "
+        "Requires ROBOFLOW_API_KEY environment variable.",
+    )
+    parser.add_argument(
+        "--roboflow-confidence",
+        type=float,
+        default=0.4,
+        help="Confidence threshold for Roboflow hoop model (default: 0.4)",
     )
     parser.add_argument(
         "--device",
         choices=["auto", "cuda", "cpu"],
         default="auto",
         help="Compute device (default: auto)",
+    )
+    parser.add_argument(
+        "--no-players",
+        action="store_true",
+        help="Disable player detection and tracking (faster analysis)",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Show live detection preview during analysis (per-frame)",
+    )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Replay each clip with full analysis results after processing",
+    )
+    parser.add_argument(
+        "--review-export",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Save review replay videos to DIR (implies --review). "
+        "Files are named clip_<N>.mp4 (timeline mode) or review.mp4 (single video).",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -117,20 +184,41 @@ def main(argv: list[str] | None = None) -> int:
 
     is_timeline_mode = args.timeline is not None
 
+    # Parse clip indices
+    clip_indices = None
+    if args.clip is not None:
+        if not is_timeline_mode:
+            print("Error: --clip can only be used with --timeline", file=sys.stderr)
+            return 1
+        try:
+            clip_indices = _parse_clip_indices(args.clip)
+        except ValueError as e:
+            print(f"Error: invalid --clip value: {e}", file=sys.stderr)
+            return 1
+
     # Build config from CLI args
     config = AnalysisConfig(
         video=VideoConfig(
             yolo_model=args.yolo_model,
             yolo_confidence=args.yolo_confidence,
             frame_skip=args.frame_skip,
+            input_lut=args.input_lut,
+            roboflow_model_id=args.roboflow_model,
+            roboflow_confidence=args.roboflow_confidence,
         ),
         audio=AudioConfig(
             excitement_threshold=args.crowd_threshold,
+        ),
+        tracking=TrackingConfig(
+            enable_player_tracking=not args.no_players,
         ),
         events=EventConfig(
             min_confidence=args.min_confidence,
         ),
         device=args.device,
+        preview=args.preview,
+        review=args.review,
+        review_export=args.review_export,
     )
 
     # Determine output path
@@ -147,11 +235,10 @@ def main(argv: list[str] | None = None) -> int:
     print()
 
     if is_timeline_mode:
-        results = analyze_timeline(input_path, config, clip_index=args.clip)
+        results = analyze_timeline(
+            input_path, config, clip_indices=clip_indices, output_path=output_path,
+        )
     else:
-        if args.clip is not None:
-            print("Error: --clip can only be used with --timeline", file=sys.stderr)
-            return 1
         results = analyze_video(input_path, config)
 
     save_results(results, output_path)

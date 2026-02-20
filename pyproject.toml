@@ -18,6 +18,7 @@ dependencies = [
     "filterpy>=1.4",
     "tqdm>=4.65",
     "setuptools<81",
+    "inference>=0.9",
 ]
 
 [project.optional-dependencies]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from src.analysis.color import FrameLUT
 from src.config import VideoConfig
 
 logger = logging.getLogger(__name__)
@@ -60,14 +62,19 @@ class ObjectDetector:
     "basketball", "hoop", "player").
     """
 
-    def __init__(self, config: VideoConfig | None = None, device: str = "auto"):
+    def __init__(self, config: VideoConfig | None = None, device: str = "auto", detect_players: bool = True):
         self.config = config or VideoConfig()
         self.model = YOLO(self.config.yolo_model)
         self._is_custom = self._check_custom_model()
         self._device = self._resolve_device(device)
+        self._detect_players = detect_players
+        self._hoop_model = None
+        if self.config.roboflow_model_id:
+            self._hoop_model = self._load_roboflow_model(self.config.roboflow_model_id)
         logger.info(
-            "Loaded YOLO model %s (custom=%s, device=%s)",
+            "Loaded YOLO model %s (custom=%s, device=%s, hoop_model=%s)",
             self.config.yolo_model, self._is_custom, self._device,
+            self.config.roboflow_model_id or "none",
         )
 
     @staticmethod
@@ -86,6 +93,29 @@ class ObjectDetector:
         """Check if loaded model has basketball-specific classes."""
         names = self.model.names or {}
         return "basketball" in [str(v).lower() for v in names.values()]
+
+    @staticmethod
+    def _load_roboflow_model(model_id: str):
+        """Load a Roboflow model via the inference SDK."""
+        try:
+            from inference import get_model
+        except ImportError:
+            logger.error(
+                "The 'inference' package is required for --roboflow-model. "
+                "Install it with: pip install inference"
+            )
+            raise
+
+        api_key = os.environ.get("ROBOFLOW_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "ROBOFLOW_API_KEY environment variable is required when using "
+                "--roboflow-model. Set it with: export ROBOFLOW_API_KEY=your_key"
+            )
+
+        model = get_model(model_id=model_id, api_key=api_key)
+        logger.info("Loaded Roboflow model: %s", model_id)
+        return model
 
     def detect_frame(self, frame: np.ndarray, frame_idx: int) -> FrameDetections:
         """Run detection on a single frame.
@@ -127,7 +157,65 @@ class ObjectDetector:
                 else:
                     self._categorize_coco(det, cls_id, fd)
 
+        # Drop player detections when player tracking is disabled
+        if not self._detect_players:
+            fd.players.clear()
+
+        if self._hoop_model is not None:
+            self._detect_roboflow(frame, frame_idx, fd)
+
         return fd
+
+    def _detect_roboflow(self, frame: np.ndarray, frame_idx: int, fd: FrameDetections) -> None:
+        """Run Roboflow model and append hoop and ball detections."""
+        _HOOP_CLASSES = {"hoop", "rim", "basket"}
+        _BALL_CLASSES = {"basketball", "ball"}
+        try:
+            results = self._hoop_model.infer(
+                frame, confidence=self.config.roboflow_confidence,
+            )
+        except Exception:
+            logger.debug("Roboflow inference failed on frame %d", frame_idx, exc_info=True)
+            return
+
+        # results may be a list or a single response object
+        predictions = []
+        if isinstance(results, list):
+            for r in results:
+                predictions.extend(getattr(r, "predictions", []))
+        else:
+            predictions = getattr(results, "predictions", [])
+
+        for pred in predictions:
+            cls_name = getattr(pred, "class_name", "") or ""
+            cls_lower = cls_name.lower()
+
+            if cls_lower in _HOOP_CLASSES:
+                target_list = fd.hoops
+                canonical_name = "hoop"
+            elif cls_lower in _BALL_CLASSES:
+                target_list = fd.balls
+                canonical_name = "basketball"
+            else:
+                continue
+
+            # Roboflow returns center x/y + width/height
+            cx = int(pred.x)
+            cy = int(pred.y)
+            w = int(pred.width)
+            h = int(pred.height)
+            x1 = cx - w // 2
+            y1 = cy - h // 2
+            x2 = cx + w // 2
+            y2 = cy + h // 2
+
+            det = Detection(
+                class_name=canonical_name,
+                confidence=float(pred.confidence),
+                bbox=(x1, y1, x2, y2),
+                frame_idx=frame_idx,
+            )
+            target_list.append(det)
 
     def detect_video(self, video_path: Path) -> list[FrameDetections]:
         """Run detection on all frames of a video (respecting frame_skip).
@@ -138,6 +226,8 @@ class ObjectDetector:
         Returns:
             List of FrameDetections for each analyzed frame.
         """
+        lut = FrameLUT(self.config.input_lut)
+
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {video_path}")
@@ -157,6 +247,7 @@ class ObjectDetector:
                 break
 
             if frame_idx % self.config.frame_skip == 0:
+                frame = lut.apply(frame)
                 # Downscale if needed
                 h, w = frame.shape[:2]
                 if max(h, w) > self.config.max_resolution:
