@@ -222,28 +222,45 @@ class ClipReview:
         ball_positions: list[BallPosition],
         ball_lookup: dict[int, BallPosition],
         hoop_pos: tuple[int, int] | None,
+        max_resolution: int = 0,
     ) -> tuple[np.ndarray, float]:
-        """Render all analysis overlays onto a frame. Returns (canvas, scale)."""
-        canvas, scale = _scale_frame(frame.copy())
+        """Render all analysis overlays onto a frame. Returns (canvas, scale).
+
+        Detection coordinates live in analysis-resolution space (after
+        ``max_resolution`` downscale during analysis).  When the review
+        frame is larger than the analysis frame we need a corrected scale
+        to map overlay coordinates onto the display canvas.
+        """
+        h, w = frame.shape[:2]
+        canvas, display_scale = _scale_frame(frame.copy())
+
+        # How much the frame was shrunk during analysis
+        if max_resolution > 0 and max(h, w) > max_resolution:
+            analysis_scale = max_resolution / max(h, w)
+        else:
+            analysis_scale = 1.0
+        # Maps analysis coords → display coords
+        coord_scale = display_scale / analysis_scale
+
         fd = det_lookup.get(frame_idx)
 
         # Draw median hoop position
         if hoop_pos:
-            hx, hy = int(hoop_pos[0] * scale), int(hoop_pos[1] * scale)
+            hx, hy = int(hoop_pos[0] * coord_scale), int(hoop_pos[1] * coord_scale)
             cv2.rectangle(canvas, (hx - 30, hy - 20), (hx + 30, hy + 20), COLOR_HOOP, 2)
             _put_label(canvas, "hoop", hx - 30, hy - 26, COLOR_HOOP)
 
         # Draw player bounding boxes
         if fd:
             for det in fd.players:
-                _draw_bbox(canvas, det.bbox, COLOR_PLAYER, scale=scale)
+                _draw_bbox(canvas, det.bbox, COLOR_PLAYER, scale=coord_scale)
 
         # Draw shot arc trajectories
         for shot in shot_events:
             if shot.start_frame <= frame_idx <= shot.end_frame + 30:
                 color = COLOR_SHOT_MADE if shot.made else COLOR_SHOT_ATTEMPT
                 pts = [
-                    (int(bp.x * scale), int(bp.y * scale))
+                    (int(bp.x * coord_scale), int(bp.y * coord_scale))
                     for bp in shot.ball_positions
                     if bp.frame_idx <= frame_idx
                 ]
@@ -258,14 +275,14 @@ class ClipReview:
         for i in range(1, len(recent_ball)):
             alpha = i / len(recent_ball)
             color = tuple(int(c * alpha) for c in COLOR_BALL)
-            p1 = (int(recent_ball[i - 1].x * scale), int(recent_ball[i - 1].y * scale))
-            p2 = (int(recent_ball[i].x * scale), int(recent_ball[i].y * scale))
+            p1 = (int(recent_ball[i - 1].x * coord_scale), int(recent_ball[i - 1].y * coord_scale))
+            p2 = (int(recent_ball[i].x * coord_scale), int(recent_ball[i].y * coord_scale))
             cv2.line(canvas, p1, p2, color, 2)
 
         # Draw current ball position
         bp = ball_lookup.get(frame_idx)
         if bp:
-            cv2.circle(canvas, (int(bp.x * scale), int(bp.y * scale)), 5, COLOR_BALL, -1)
+            cv2.circle(canvas, (int(bp.x * coord_scale), int(bp.y * coord_scale)), 5, COLOR_BALL, -1)
 
         # Draw event labels during their frame ranges
         y_offset = 30
@@ -276,9 +293,9 @@ class ClipReview:
                 y_offset += 24
 
         # Event timeline bar at top
-        self._draw_timeline_bar(canvas, frame_idx, start_frame, end_frame, game_events, scale)
+        self._draw_timeline_bar(canvas, frame_idx, start_frame, end_frame, game_events, display_scale)
 
-        return canvas, scale
+        return canvas, display_scale
 
     def export(
         self,
@@ -293,6 +310,7 @@ class ClipReview:
         ball_positions: list[BallPosition],
         fps: float,
         input_lut: Path | None = None,
+        max_resolution: int = 0,
     ) -> None:
         """Export the review replay as a video file (no display window)."""
         result = self._prepare(
@@ -318,6 +336,7 @@ class ClipReview:
                 frame, frame_idx, start_frame, end_frame,
                 det_lookup, shot_events, game_events,
                 ball_positions, ball_lookup, hoop_pos,
+                max_resolution=max_resolution,
             )
 
             # HUD (no pause/controls in export)
@@ -350,6 +369,7 @@ class ClipReview:
         ball_positions: list[BallPosition],
         fps: float,
         input_lut: Path | None = None,
+        max_resolution: int = 0,
     ) -> None:
         """Replay a clip's video with full analysis overlays (interactive window)."""
         try:
@@ -381,6 +401,7 @@ class ClipReview:
                 frame, frame_idx, start_frame, end_frame,
                 det_lookup, shot_events, game_events,
                 ball_positions, ball_lookup, hoop_pos,
+                max_resolution=max_resolution,
             )
 
             # HUD

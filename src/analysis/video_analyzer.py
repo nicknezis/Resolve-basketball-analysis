@@ -84,6 +84,7 @@ def analyze_video(
         ball_positions=ball_tracker._positions,
         fps=fps,
         input_lut=config.video.input_lut,
+        max_resolution=config.video.max_resolution,
     )
     if config.review_export:
         config.review_export.mkdir(parents=True, exist_ok=True)
@@ -401,6 +402,7 @@ def _analyze_clip(
         ball_positions=ball_tracker._positions,
         fps=media_fps,
         input_lut=config.video.input_lut,
+        max_resolution=config.video.max_resolution,
     )
     if config.review_export:
         config.review_export.mkdir(parents=True, exist_ok=True)
