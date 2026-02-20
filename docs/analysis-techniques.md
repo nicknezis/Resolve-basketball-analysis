@@ -8,7 +8,7 @@ The engine uses a six-phase pipeline to detect basketball game events from video
 
 1. **Scene Detection** -- Identify shot/scene boundaries using frame-to-frame HSV comparison
 2. **Audio Analysis** -- Extract crowd excitement peaks and referee whistle events from the audio track
-3. **Object Detection** -- Run YOLOv8 inference to locate the basketball, hoop, and players in each frame
+3. **Object Detection** -- Run YOLO inference to locate the basketball, hoop, and players in each frame
 4. **Ball Tracking** -- Smooth ball trajectory with a Kalman filter and detect shot arcs
 5. **Player Tracking** -- Maintain player identity across frames with DeepSORT and classify teams by jersey color
 6. **Event Classification** -- Fuse video and audio signals into final `GameEvent` objects with confidence scores
@@ -23,16 +23,33 @@ Each phase is implemented as an independent module under `src/analysis/`. The pi
 
 ### Model
 
-YOLOv8 Medium (`yolov8m.pt`) via the Ultralytics library. The model auto-downloads on first run.
+YOLO Medium (`yolo11m.pt`) via the Ultralytics library. The model auto-downloads on first run.
 
 Two model modes are supported:
 
 | Mode | Detected classes | Source |
 |------|-----------------|--------|
-| **COCO (stock)** | `person` (class 0), `sports ball` (class 32) | Pre-trained YOLOv8 |
+| **COCO (stock)** | `person` (class 0), `sports ball` (class 32) | Pre-trained YOLO |
 | **Custom** | `basketball`, `hoop`, `player` | User-trained model |
 
-The detector auto-detects which mode to use by checking if the loaded model's class names contain `"basketball"`. COCO models cannot detect the hoop -- shot detection relies on arc geometry alone in that case.
+The detector auto-detects which mode to use by checking if the loaded model's class names contain `"basketball"`. COCO models cannot detect the hoop -- shot detection relies on arc geometry alone unless a Roboflow model is also used (see below).
+
+### Roboflow Supplemental Detection
+
+An optional Roboflow model (`--roboflow-model MODEL_ID`) can supplement YOLO detection. It runs on every analyzed frame after YOLO and appends its results to the same `FrameDetections` object.
+
+Supported Roboflow class mappings:
+
+| Roboflow class | Mapped to | Appended to |
+|----------------|-----------|-------------|
+| `hoop`, `rim`, `basket` | `"hoop"` | `fd.hoops` |
+| `basketball`, `ball` | `"basketball"` | `fd.balls` |
+
+This is useful in two scenarios:
+- **Hoop detection with COCO models:** Stock YOLO has no hoop class, so Roboflow provides the hoop detections needed for made-shot classification.
+- **Supplemental ball detection:** Roboflow basketball detections can catch balls that YOLO's generic `sports ball` class misses.
+
+Requires the `inference` pip package and a `ROBOFLOW_API_KEY` environment variable. Confidence threshold is controlled by `--roboflow-confidence` (default 0.4).
 
 ### Frame Preprocessing
 
@@ -221,9 +238,9 @@ Processes one video file through the six-phase pipeline in order:
 
 1. Scene detection
 2. Audio analysis (extract + crowd excitement + whistle detection)
-3. Object detection (YOLO on every Nth frame)
+3. Object detection (YOLO on every Nth frame, optionally supplemented by Roboflow)
 4. Ball tracking (Kalman filter + shot arc detection)
-5. Player tracking (DeepSORT + team classification)
+5. Player tracking (DeepSORT + team classification) — skipped when `--no-players` is set
 6. Event classification (multi-modal fusion)
 
 Output events use frame numbers and timestamps relative to the video file.
@@ -249,7 +266,7 @@ This handles FPS differences between source media and timeline (e.g., 59.94fps m
 
 After all clips are processed, events are sorted by timeline position and merged across clip boundaries using the same merge logic.
 
-The `--clip N` flag limits analysis to a single clip (0-based index) for testing.
+The `--clip SPEC` flag limits analysis to specific clips (0-based). Supports single indices (`3`), comma-separated lists (`0,2,5`), ranges (`1-4`), and mixed (`0,3-5,8`).
 
 ---
 
@@ -261,10 +278,13 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `yolo_model` | `str` | `"yolov8m.pt"` | YOLO model file (auto-downloads) |
+| `yolo_model` | `str` | `"yolo11m.pt"` | YOLO model file (auto-downloads) |
 | `yolo_confidence` | `float` | `0.5` | Minimum detection confidence |
 | `frame_skip` | `int` | `2` | Analyze every Nth frame |
 | `max_resolution` | `int` | `1920` | Downscale frames larger than this |
+| `input_lut` | `Path \| None` | `None` | Path to `.cube` 3D LUT file (or `.zip`/`.lut` archive) for log footage |
+| `roboflow_model_id` | `str \| None` | `None` | Roboflow model ID for supplemental detection (e.g. `"basketball-detection/1"`) |
+| `roboflow_confidence` | `float` | `0.5` | Confidence threshold for Roboflow model |
 
 ### AudioConfig
 
@@ -290,8 +310,11 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `max_ball_gap_frames` | `int` | `10` | Max frames to interpolate missing ball |
 | `shot_min_arc_height_px` | `int` | `50` | Minimum arc height (pixels) for a shot |
 | `hoop_proximity_px` | `int` | `80` | Distance (pixels) to count as through hoop |
+| `hoop_x_tolerance_ratio` | `float` | `0.3` | Horizontal tolerance as fraction of hoop bbox width |
+| `hoop_entry_y_margin_px` | `int` | `30` | Vertical margin above/below hoop top for entry detection |
 | `deepsort_max_age` | `int` | `30` | Frames before dropping unmatched track |
 | `deepsort_n_init` | `int` | `3` | Detections needed to confirm a track |
+| `enable_player_tracking` | `bool` | `True` | Set `False` to skip DeepSORT player tracking (`--no-players`) |
 
 ### EventConfig
 
@@ -322,3 +345,6 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `scene` | `SceneConfig` | *(defaults)* | Scene detection settings |
 | `output_dir` | `Path` | `"output"` | Output directory for results |
 | `device` | `str` | `"auto"` | Compute device: `"auto"`, `"cuda"`, `"mps"`, `"cpu"` |
+| `preview` | `bool` | `False` | Show per-frame live detection preview during analysis |
+| `review` | `bool` | `False` | Interactive replay with full overlays after each clip |
+| `review_export` | `Path \| None` | `None` | Directory to save review replay videos (e.g. `clip_0.mp4`) |

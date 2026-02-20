@@ -169,14 +169,32 @@ basketball-analyze [video] [--timeline JSON] [options]
 Positional:
   video                    Path to a video file (single-video mode)
 
-Options:
+Input:
   --timeline PATH          Path to a Resolve timeline export JSON (timeline mode)
-  -o, --output PATH        Output JSON path (default: <input>_analysis.json)
-  --yolo-model NAME        YOLO model name or path (default: yolov8m.pt)
+  --clip SPEC              Clips to analyze: single (3), list (0,2,5), range (1-4),
+                           or mixed (0,3-5,8). Timeline mode only.
+  --input-lut PATH         3D LUT (.cube or .zip/.lut archive) for log footage
+
+Detection:
+  --yolo-model NAME        YOLO model name or path (default: yolo11m.pt)
   --yolo-confidence FLOAT  Detection confidence threshold (default: 0.5)
+  --roboflow-model ID      Roboflow model for hoop + ball detection
+                           (e.g. basketball-detection/1). Requires ROBOFLOW_API_KEY.
+  --roboflow-confidence F  Roboflow confidence threshold (default: 0.5)
   --frame-skip N           Analyze every Nth frame (default: 2)
+  --no-players             Disable player detection and tracking (faster)
+
+Classification:
   --min-confidence FLOAT   Minimum event confidence to report (default: 0.7)
   --crowd-threshold FLOAT  Crowd excitement threshold (default: 0.6)
+
+Output:
+  -o, --output PATH        Output JSON path (default: <input>_analysis.json)
+  --review-export DIR      Save review replay videos to DIR (clip_<N>.mp4)
+
+Display:
+  --preview                Show live detection preview during analysis
+  --review                 Interactive replay with overlays after analysis
   --device {auto,cuda,cpu} Compute device (default: auto)
   -v, --verbose            Enable debug logging
 ```
@@ -212,7 +230,7 @@ Options:
 ```
 Video file ──┬──► Scene Detection (PySceneDetect)
              │
-             ├──► Object Detection (YOLOv8) ──► Ball Tracking (Kalman filter)
+             ├──► Object Detection (YOLO) ──► Ball Tracking (Kalman filter)
              │                                       │
              │                                       ├──► Shot Detection
              │                                       │    (arc trajectory + hoop proximity)
@@ -264,11 +282,13 @@ Resolve-basketball-analysis/
 │   ├── analysis/                    # Standalone analysis engine
 │   │   ├── video_analyzer.py        # Pipeline orchestrator (single + timeline modes)
 │   │   ├── audio_analyzer.py        # Crowd excitement + whistle detection
-│   │   ├── object_detector.py       # YOLO-based ball/hoop/player detection
+│   │   ├── object_detector.py       # YOLO + Roboflow detection (ball, hoop, players)
 │   │   ├── ball_tracker.py          # Kalman filter tracking + shot detection
 │   │   ├── player_tracker.py        # DeepSORT tracking + team color classification
 │   │   ├── scene_detector.py        # PySceneDetect wrapper
-│   │   └── event_classifier.py      # Multi-modal event fusion
+│   │   ├── event_classifier.py      # Multi-modal event fusion
+│   │   ├── preview.py               # Live preview + review replay + video export
+│   │   └── color.py                 # 3D LUT parsing + per-frame color conversion
 │   │
 │   ├── resolve/                     # DaVinci Resolve integration scripts
 │   │   ├── export.py                # Export timeline structure to JSON
@@ -320,7 +340,7 @@ All detection thresholds live in `src/config.py` and can be tuned without modify
 
 | Setting | CLI Flag | Default | What It Controls |
 |---------|----------|---------|-----------------|
-| YOLO model | `--yolo-model` | `yolov8m.pt` | Model size: `n` (fast) to `x` (accurate) |
+| YOLO model | `--yolo-model` | `yolo11m.pt` | Model size: `n` (fast) to `x` (accurate) |
 | Detection threshold | `--yolo-confidence` | `0.5` | How confident YOLO must be to report a detection |
 | Frame skip | `--frame-skip` | `2` | Analyze every Nth frame (higher = faster, less accurate) |
 | Min event confidence | `--min-confidence` | `0.7` | Events below this are excluded from output |
