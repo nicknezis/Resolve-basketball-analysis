@@ -25,42 +25,9 @@ logger = logging.getLogger(__name__)
 
 
 def get_resolve():
-    """Connect to the running DaVinci Resolve instance.
-
-    The Resolve scripting API module is dynamically loaded because it is
-    only available when Resolve is installed and its environment variables
-    are set.
-
-    Returns:
-        The Resolve API object, or None if connection fails.
-    """
-    try:
-        import DaVinciResolveScript as dvr
-        resolve = dvr.scriptapp("Resolve")
-        return resolve
-    except ImportError:
-        # Try the fusionscript fallback path
-        pass
-
-    # Resolve typically adds its script module to one of these paths
-    import importlib.util
-    search_paths = [
-        "/opt/resolve/Developer/Scripting/Modules",
-        "/opt/resolve/libs/Fusion/",
-        "C:\\ProgramData\\Blackmagic Design\\DaVinci Resolve\\Support\\Developer\\Scripting\\Modules",
-        "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
-    ]
-
-    for path in search_paths:
-        module_path = Path(path) / "DaVinciResolveScript.py"
-        if module_path.exists():
-            spec = importlib.util.spec_from_file_location("DaVinciResolveScript", module_path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            resolve = module.scriptapp("Resolve")
-            return resolve
-
-    return None
+    """Connect to the running DaVinci Resolve instance."""
+    from src.resolve.export import get_resolve as _get_resolve
+    return _get_resolve()
 
 
 def load_analysis(json_path: Path) -> dict:

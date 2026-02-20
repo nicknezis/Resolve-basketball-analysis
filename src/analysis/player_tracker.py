@@ -15,6 +15,20 @@ from src.config import TrackingConfig
 logger = logging.getLogger(__name__)
 
 
+def _gpu_available(device: str = "auto") -> bool:
+    """Check if a GPU backend is available for PyTorch."""
+    if device == "cpu":
+        return False
+    try:
+        import torch
+        if device == "cuda":
+            return torch.cuda.is_available()
+        # "auto" — prefer CUDA, then MPS (Apple Silicon)
+        return torch.cuda.is_available() or torch.backends.mps.is_available()
+    except Exception:
+        return False
+
+
 @dataclass
 class TrackedPlayer:
     """A player tracked across frames with team assignment."""
@@ -42,11 +56,13 @@ class PlayerTracker:
     clustering into two groups.
     """
 
-    def __init__(self, config: TrackingConfig | None = None):
+    def __init__(self, config: TrackingConfig | None = None, device: str = "auto"):
         self.config = config or TrackingConfig()
+        self._gpu = _gpu_available(device)
         self._tracker = DeepSort(
             max_age=self.config.deepsort_max_age,
             n_init=self.config.deepsort_n_init,
+            embedder_gpu=self._gpu,
         )
         self._color_samples: dict[int, list[np.ndarray]] = {}  # track_id -> HSV samples
         self._tracks: dict[int, TrackedPlayer] = {}
@@ -56,6 +72,7 @@ class PlayerTracker:
         self._tracker = DeepSort(
             max_age=self.config.deepsort_max_age,
             n_init=self.config.deepsort_n_init,
+            embedder_gpu=self._gpu,
         )
         self._color_samples = {}
         self._tracks = {}

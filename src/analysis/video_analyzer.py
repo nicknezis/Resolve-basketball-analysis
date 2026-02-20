@@ -81,6 +81,7 @@ def analyze_video(
 def analyze_timeline(
     timeline_json_path: Path,
     config: AnalysisConfig | None = None,
+    clip_index: int | None = None,
 ) -> dict:
     """Run analysis on a Resolve timeline export, processing each clip.
 
@@ -96,6 +97,8 @@ def analyze_timeline(
         timeline_json_path: Path to the timeline export JSON from
             ``python -m src.resolve.export``.
         config: Analysis configuration. Uses defaults if None.
+        clip_index: If provided, only process this clip (0-based index
+            across all tracks). Useful for testing with a single clip.
 
     Returns:
         Analysis results dict with timeline-relative frame positions.
@@ -112,38 +115,53 @@ def analyze_timeline(
 
     logger.info("Analyzing timeline '%s' at %.2f fps", tl_name, tl_fps)
 
+    # Flatten all clips across tracks with their indices for --clip support
+    all_clips = []
+    for track in timeline_data.get("tracks", []):
+        track_idx = track["track_index"]
+        for clip in track.get("clips", []):
+            all_clips.append((track_idx, clip))
+
+    if clip_index is not None:
+        if clip_index < 0 or clip_index >= len(all_clips):
+            logger.error(
+                "Clip index %d out of range (timeline has %d clips)",
+                clip_index, len(all_clips),
+            )
+            return {"error": f"Clip index {clip_index} out of range (0-{len(all_clips) - 1})"}
+        all_clips = [all_clips[clip_index]]
+        logger.info("Processing only clip %d of %d", clip_index, len(all_clips))
+
     all_events: list[GameEvent] = []
     all_scenes: list[Scene] = []
     clips_analyzed = 0
     clips_skipped = 0
 
-    for track in timeline_data.get("tracks", []):
-        track_idx = track["track_index"]
-        for clip in track.get("clips", []):
-            clip_name = clip.get("clip_name", "unknown")
-            analysis_path = clip.get("analysis_path", "") or clip.get("file_path", "")
+    for track_idx, clip in all_clips:
+        clip_name = clip.get("clip_name", "unknown")
+        analysis_path = clip.get("analysis_path", "") or clip.get("file_path", "")
 
-            if not analysis_path or not Path(analysis_path).exists():
-                logger.warning(
-                    "Skipping clip '%s' — media file not found: %s",
-                    clip_name, analysis_path,
-                )
-                clips_skipped += 1
-                continue
-
-            logger.info(
-                "=== Analyzing clip '%s' (track %d) ===", clip_name, track_idx,
+        if not analysis_path or not Path(analysis_path).exists():
+            logger.warning(
+                "Skipping clip '%s' — media file not found: %s",
+                clip_name, analysis_path,
             )
+            clips_skipped += 1
+            continue
 
-            clip_events, clip_scenes = _analyze_clip(
-                clip_info=clip,
-                timeline_fps=tl_fps,
-                config=config,
-            )
+        logger.info(
+            "=== Analyzing clip '%s' (track %d) ===", clip_name, track_idx,
+        )
 
-            all_events.extend(clip_events)
-            all_scenes.extend(clip_scenes)
-            clips_analyzed += 1
+        clip_events, clip_scenes = _analyze_clip(
+            clip_info=clip,
+            timeline_fps=tl_fps,
+            config=config,
+        )
+
+        all_events.extend(clip_events)
+        all_scenes.extend(clip_scenes)
+        clips_analyzed += 1
 
     # Sort all events by timeline position
     all_events.sort(key=lambda e: e.start_sec)
@@ -190,9 +208,9 @@ def _analyze_clip(
     )
 
     # --- Video analysis on the source range ---
-    detector = ObjectDetector(config.video)
+    detector = ObjectDetector(config.video, device=config.device)
     ball_tracker = BallTracker(config.tracking)
-    player_tracker = PlayerTracker(config.tracking)
+    player_tracker = PlayerTracker(config.tracking, device=config.device)
 
     cap = cv2.VideoCapture(str(analysis_path))
     if not cap.isOpened():
@@ -433,7 +451,7 @@ def _run_pipeline(
     audio_events = analyze_audio(video_path, config.audio)
 
     logger.info("=== Phase 3: Object Detection ===")
-    detector = ObjectDetector(config.video)
+    detector = ObjectDetector(config.video, device=config.device)
     all_detections = detector.detect_video(video_path)
 
     logger.info("=== Phase 4: Ball Tracking ===")
@@ -441,7 +459,7 @@ def _run_pipeline(
     shot_events = ball_tracker.detect_shots(all_detections)
 
     logger.info("=== Phase 5: Player Tracking ===")
-    player_tracker = PlayerTracker(config.tracking)
+    player_tracker = PlayerTracker(config.tracking, device=config.device)
     cap = cv2.VideoCapture(str(video_path))
     frame_idx = 0
 

@@ -60,13 +60,27 @@ class ObjectDetector:
     "basketball", "hoop", "player").
     """
 
-    def __init__(self, config: VideoConfig | None = None):
+    def __init__(self, config: VideoConfig | None = None, device: str = "auto"):
         self.config = config or VideoConfig()
         self.model = YOLO(self.config.yolo_model)
         self._is_custom = self._check_custom_model()
+        self._device = self._resolve_device(device)
         logger.info(
-            "Loaded YOLO model %s (custom=%s)", self.config.yolo_model, self._is_custom,
+            "Loaded YOLO model %s (custom=%s, device=%s)",
+            self.config.yolo_model, self._is_custom, self._device,
         )
+
+    @staticmethod
+    def _resolve_device(device: str) -> str:
+        """Pick the best available device."""
+        if device != "auto":
+            return device
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
 
     def _check_custom_model(self) -> bool:
         """Check if loaded model has basketball-specific classes."""
@@ -86,6 +100,7 @@ class ObjectDetector:
         results = self.model(
             frame,
             conf=self.config.yolo_confidence,
+            device=self._device,
             verbose=False,
         )
         fd = FrameDetections(frame_idx=frame_idx)

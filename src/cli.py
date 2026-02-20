@@ -72,6 +72,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Crowd excitement detection threshold (default: 0.6)",
     )
     parser.add_argument(
+        "--clip",
+        type=int,
+        default=None,
+        metavar="N",
+        help="In timeline mode, process only the Nth clip (0-based index "
+        "across all tracks). Useful for testing a single clip.",
+    )
+    parser.add_argument(
         "--device",
         choices=["auto", "cuda", "cpu"],
         default="auto",
@@ -139,8 +147,11 @@ def main(argv: list[str] | None = None) -> int:
     print()
 
     if is_timeline_mode:
-        results = analyze_timeline(input_path, config)
+        results = analyze_timeline(input_path, config, clip_index=args.clip)
     else:
+        if args.clip is not None:
+            print("Error: --clip can only be used with --timeline", file=sys.stderr)
+            return 1
         results = analyze_video(input_path, config)
 
     save_results(results, output_path)

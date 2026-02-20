@@ -20,28 +20,79 @@ logger = logging.getLogger(__name__)
 
 
 def get_resolve():
-    """Connect to the running DaVinci Resolve instance."""
+    """Connect to the running DaVinci Resolve instance.
+
+    Requires DaVinci Resolve to be running with scripting enabled
+    (Preferences > General > External scripting using > Local).
+    """
+    import os
+    import sys as _sys
+
+    # Ensure environment variables are set for the native library loader
+    if _sys.platform.startswith("darwin"):
+        os.environ.setdefault(
+            "RESOLVE_SCRIPT_API",
+            "/Library/Application Support/Blackmagic Design"
+            "/DaVinci Resolve/Developer/Scripting",
+        )
+        os.environ.setdefault(
+            "RESOLVE_SCRIPT_LIB",
+            "/Applications/DaVinci Resolve/DaVinci Resolve.app"
+            "/Contents/Libraries/Fusion/fusionscript.so",
+        )
+        _modules_path = (
+            "/Library/Application Support/Blackmagic Design"
+            "/DaVinci Resolve/Developer/Scripting/Modules"
+        )
+    elif _sys.platform.startswith("win"):
+        os.environ.setdefault(
+            "RESOLVE_SCRIPT_API",
+            "C:\\ProgramData\\Blackmagic Design\\DaVinci Resolve"
+            "\\Support\\Developer\\Scripting",
+        )
+        os.environ.setdefault(
+            "RESOLVE_SCRIPT_LIB",
+            "C:\\Program Files\\Blackmagic Design\\DaVinci Resolve"
+            "\\fusionscript.dll",
+        )
+        _modules_path = (
+            "C:\\ProgramData\\Blackmagic Design\\DaVinci Resolve"
+            "\\Support\\Developer\\Scripting\\Modules"
+        )
+    else:
+        os.environ.setdefault(
+            "RESOLVE_SCRIPT_API",
+            "/opt/resolve/Developer/Scripting",
+        )
+        os.environ.setdefault(
+            "RESOLVE_SCRIPT_LIB",
+            "/opt/resolve/libs/Fusion/fusionscript.so",
+        )
+        _modules_path = "/opt/resolve/Developer/Scripting/Modules"
+
+    # Add the Resolve scripting modules directory to sys.path so the
+    # native fusionscript library is found correctly (importlib file-based
+    # loading breaks the module's internal import chain).
+    if _modules_path not in _sys.path:
+        _sys.path.insert(0, _modules_path)
+
     try:
         import DaVinciResolveScript as dvr
-        return dvr.scriptapp("Resolve")
+        resolve = dvr.scriptapp("Resolve")
+        if resolve is None:
+            logger.error(
+                "scriptapp('Resolve') returned None — "
+                "is DaVinci Resolve running with scripting enabled?"
+            )
+        return resolve
     except ImportError:
-        pass
-
-    import importlib.util
-    search_paths = [
-        "/opt/resolve/Developer/Scripting/Modules",
-        "/opt/resolve/libs/Fusion/",
-        "C:\\ProgramData\\Blackmagic Design\\DaVinci Resolve\\Support\\Developer\\Scripting\\Modules",
-        "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
-    ]
-    for path in search_paths:
-        module_path = Path(path) / "DaVinciResolveScript.py"
-        if module_path.exists():
-            spec = importlib.util.spec_from_file_location("DaVinciResolveScript", module_path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module.scriptapp("Resolve")
-    return None
+        logger.error(
+            "Could not import DaVinciResolveScript. "
+            "Verify that DaVinci Resolve is installed and the scripting "
+            "modules exist at: %s",
+            _modules_path,
+        )
+        return None
 
 
 def _timecode_to_frames(tc: str, fps: float) -> int:
