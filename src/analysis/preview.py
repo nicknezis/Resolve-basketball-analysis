@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 from collections import deque
 from pathlib import Path
 
@@ -326,6 +327,9 @@ class ClipReview:
         frame_idx = start_frame
         logger.info("Exporting review video to %s (%d frames)", export_path, total)
 
+        # Write video to a temp file so we can mux audio afterward.
+        tmp_path = export_path.with_suffix(".tmp.mp4")
+
         while frame_idx < end_frame:
             ret, frame = cap.read()
             if not ret:
@@ -347,7 +351,7 @@ class ClipReview:
             if writer is None:
                 h, w = canvas.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(str(export_path), fourcc, fps, (w, h))
+                writer = cv2.VideoWriter(str(tmp_path), fourcc, fps, (w, h))
             writer.write(canvas)
 
             frame_idx += 1
@@ -355,6 +359,33 @@ class ClipReview:
         if writer is not None:
             writer.release()
         cap.release()
+
+        if writer is None:
+            return
+
+        # Mux audio from the source video into the exported clip.
+        audio_start = start_frame / fps
+        audio_duration = (end_frame - start_frame) / fps
+        mux_cmd = [
+            "ffmpeg", "-y",
+            "-i", str(tmp_path),
+            "-ss", str(audio_start),
+            "-t", str(audio_duration),
+            "-i", video_path,
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-map", "0:v:0",
+            "-map", "1:a:0?",
+            "-shortest",
+            str(export_path),
+        ]
+        try:
+            subprocess.run(mux_cmd, capture_output=True, check=True)
+            tmp_path.unlink(missing_ok=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            logger.warning("Could not mux audio, keeping video-only export: %s", exc)
+            tmp_path.rename(export_path)
+
         logger.info("Review video saved: %s", export_path)
 
     def replay(
