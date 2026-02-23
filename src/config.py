@@ -50,7 +50,7 @@ class TrackingConfig:
     ball_gate_weight: float = 0.5  # blend factor: 0=pure confidence, 1=pure proximity-to-prediction
     reacquire_after_gap_frames: int = 5  # after this many missed frames, accept any detection
     shot_hoop_x_range_ratio: float = 0.5  # max horizontal distance from hoop (as fraction of frame width)
-    shot_min_descent_ratio: float = 0.4  # ball must descend at least this fraction of ascent height
+    shot_min_descent_ratio: float = 0.15  # ball must descend at least this fraction of ascent height (low to allow layups)
     shot_max_arc_frames: int = 90  # max tracked positions in a single arc (~3s at 30fps/skip-2)
     shot_pre_peak_frames: int = 15  # max frames before peak to include in shot event window
     deepsort_max_age: int = 30

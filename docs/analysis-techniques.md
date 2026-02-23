@@ -106,7 +106,7 @@ Shot detection runs as a second pass over the full tracked trajectory. The algor
 3. When the ball descends past the peak by at least `shot_min_arc_height_px` (default 50px), record the arc candidate
 4. Compute `arc_height = start_y - peak_y`; only accept if it exceeds the minimum threshold
 5. **Maximum arc duration gate**: Reject arcs spanning more than `shot_max_arc_frames` (default 90 positions, ~3 seconds at 30fps with frame_skip=2). Real basketball shots take 1-2 seconds; longer arcs indicate tracking noise or continuous ball movement.
-6. **Minimum descent ratio gate**: The ball must descend at least `shot_min_descent_ratio` (default 0.4) of its ascent height after the peak. This filters partial arcs where the ball barely crosses the threshold.
+6. **Minimum descent ratio gate**: The ball must descend at least `shot_min_descent_ratio` (default 0.15) of its ascent height after the peak. This is set low to accommodate layups, where the player carries the ball upward (inflating the measured ascent) but the actual descent through the hoop is short. Jump shots produce ratios near 1.0; layups typically produce 0.15-0.35.
 7. **Hoop-directed descent gate**: When a hoop position is known, the median x-coordinate of the ball during the descent phase must be within `shot_hoop_x_range_ratio` (default 0.5) of the frame width from the hoop's x-coordinate. This distinguishes shots (aimed at the hoop) from passes (aimed at teammates elsewhere on the court).
 
 The event time window is also tightened: instead of spanning from where the sliding window first detected upward motion, the shot event starts at most `shot_pre_peak_frames` (default 15, ~0.5s) before the arc peak. The arc height is still calculated from the original start for correctness, but the reported event window covers only the shot flight.
@@ -344,7 +344,7 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `ball_gate_weight` | `float` | `0.5` | Blend factor for gated detection: 0=pure confidence, 1=pure proximity |
 | `reacquire_after_gap_frames` | `int` | `5` | After this many missed frames, disable distance gate for re-acquisition |
 | `shot_hoop_x_range_ratio` | `float` | `0.5` | Max horizontal distance from hoop (as fraction of frame width) for arc validation |
-| `shot_min_descent_ratio` | `float` | `0.4` | Ball must descend at least this fraction of ascent height |
+| `shot_min_descent_ratio` | `float` | `0.15` | Ball must descend at least this fraction of ascent height (low for layups) |
 | `shot_max_arc_frames` | `int` | `90` | Max tracked positions in a single arc (~3s at 30fps/skip-2) |
 | `shot_pre_peak_frames` | `int` | `15` | Max frames before peak to include in shot event window |
 | `deepsort_max_age` | `int` | `30` | Frames before dropping unmatched track |

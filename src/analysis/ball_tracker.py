@@ -311,6 +311,11 @@ class BallTracker:
 
                         # Gate A: Maximum arc duration
                         if arc_len > self.config.shot_max_arc_frames:
+                            logger.debug(
+                                "Arc rejected (Gate A: duration): arc_len=%d > max=%d (frames %d-%d)",
+                                arc_len, self.config.shot_max_arc_frames,
+                                positions[arc_start].frame_idx, positions[arc_end].frame_idx,
+                            )
                             i = arc_end
                             break
 
@@ -318,6 +323,13 @@ class BallTracker:
                         descent_height = curr_y - min_y
                         d_ratio = descent_height / arc_height if arc_height > 0 else 0.0
                         if d_ratio < self.config.shot_min_descent_ratio:
+                            logger.debug(
+                                "Arc rejected (Gate B: descent_ratio): d_ratio=%.3f < min=%.3f "
+                                "(arc_height=%d, descent=%d, frames %d-%d)",
+                                d_ratio, self.config.shot_min_descent_ratio,
+                                arc_height, descent_height,
+                                positions[arc_start].frame_idx, positions[arc_end].frame_idx,
+                            )
                             i = arc_end
                             break
 
@@ -334,6 +346,12 @@ class BallTracker:
                                 frame_w = max(max(all_x) - min(all_x), 640)
                                 max_x_dist = frame_w * self.config.shot_hoop_x_range_ratio
                                 if hoop_x_dist > max_x_dist:
+                                    logger.debug(
+                                        "Arc rejected (Gate C: hoop-directed): hoop_x_dist=%.1f > max=%.1f "
+                                        "(frames %d-%d)",
+                                        hoop_x_dist, max_x_dist,
+                                        positions[arc_start].frame_idx, positions[arc_end].frame_idx,
+                                    )
                                     i = arc_end
                                     break
 
@@ -351,6 +369,11 @@ class BallTracker:
                         elif hoop_pos:
                             made = self._check_through_hoop(arc_positions, hoop_pos)
 
+                        logger.debug(
+                            "Arc accepted: frames %d-%d, arc_height=%d, d_ratio=%.3f, made=%s",
+                            positions[effective_start].frame_idx, positions[arc_end].frame_idx,
+                            arc_height, d_ratio, made,
+                        )
                         shots.append(
                             ShotEvent(
                                 start_frame=positions[effective_start].frame_idx,

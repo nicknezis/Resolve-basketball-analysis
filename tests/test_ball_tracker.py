@@ -274,6 +274,74 @@ class TestEndToEnd:
         assert shots[0].made is False
 
 
+def _make_layup_positions(
+    x: int = 450,
+    start_y: int = 400,
+    peak_y: int = 200,
+    end_y: int = 280,
+    ascent_frames: int = 15,
+    descent_frames: int = 5,
+    start_frame: int = 0,
+) -> list[BallPosition]:
+    """Generate a layup trajectory: long gradual ascent, short descent."""
+    positions: list[BallPosition] = []
+    for i in range(ascent_frames):
+        t = i / max(ascent_frames - 1, 1)
+        y = int(start_y + (peak_y - start_y) * t)
+        positions.append(BallPosition(frame_idx=start_frame + i, x=x, y=y, predicted=False))
+    for i in range(descent_frames):
+        t = i / max(descent_frames - 1, 1)
+        y = int(peak_y + (end_y - peak_y) * t)
+        positions.append(BallPosition(
+            frame_idx=start_frame + ascent_frames + i, x=x, y=y, predicted=False,
+        ))
+    return positions
+
+
+class TestLayupDetection:
+    """Tests for layup-like arcs with asymmetric ascent/descent."""
+
+    def test_layup_detected(self):
+        """Layup: long ascent (carried by player), short descent through hoop."""
+        config = TrackingConfig(shot_min_arc_height_px=50)
+        tracker = BallTracker(config)
+
+        # arc_height = 400 - 200 = 200, arc-end triggers at 200+50=250
+        # descent_height at trigger ~= 50, d_ratio ~= 50/200 = 0.25
+        positions = _make_layup_positions(
+            start_y=400, peak_y=200, end_y=280,
+            ascent_frames=15, descent_frames=5,
+        )
+        tracker._positions = positions
+
+        hoop = _make_hoop_observation(frame_idx=15, x1=400, y1=200, x2=500, y2=230)
+        tracker.set_hoop_observations([hoop])
+
+        shots = tracker.find_shots()
+        assert len(shots) >= 1, "Layup arc should be detected as a shot"
+        assert shots[0].made is True
+
+    def test_layup_rejected_at_old_threshold(self):
+        """Same layup arc is rejected with the old 0.4 threshold."""
+        config = TrackingConfig(
+            shot_min_arc_height_px=50,
+            shot_min_descent_ratio=0.4,
+        )
+        tracker = BallTracker(config)
+
+        positions = _make_layup_positions(
+            start_y=400, peak_y=200, end_y=280,
+            ascent_frames=15, descent_frames=5,
+        )
+        tracker._positions = positions
+
+        hoop = _make_hoop_observation(frame_idx=15, x1=400, y1=200, x2=500, y2=230)
+        tracker.set_hoop_observations([hoop])
+
+        shots = tracker.find_shots()
+        assert len(shots) == 0, "Old threshold 0.4 should reject this layup arc"
+
+
 class TestHoopObservationDataclass:
     """Basic tests for the HoopObservation dataclass."""
 
