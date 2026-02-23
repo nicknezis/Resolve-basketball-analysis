@@ -13,7 +13,9 @@ models/*.engine
 
 # Analysis output
 output/
+clips/
 *_analysis.json
+*_timeline.json
 
 # Virtual environments
 .venv/
