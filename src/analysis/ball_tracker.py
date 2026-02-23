@@ -46,6 +46,8 @@ class ShotEvent:
     hoop_x: int | None = None
     hoop_y: int | None = None
     hoop_bbox: tuple[int, int, int, int] | None = None
+    hoop_x_distance: float | None = None  # pixels between descent median x and hoop x
+    descent_ratio: float | None = None  # descent_height / arc_height
 
 
 class BallTracker:
@@ -101,6 +103,11 @@ class BallTracker:
     def update(self, frame_detections: FrameDetections) -> BallPosition | None:
         """Process detections for one frame and return tracked ball position.
 
+        Uses spatially-gated detection: candidates are scored by a blend of
+        confidence and proximity to the Kalman filter's predicted position.
+        Detections beyond ``max_ball_jump_px`` are rejected unless the tracker
+        is re-acquiring after an extended gap.
+
         Args:
             frame_detections: Detections for this frame from ObjectDetector.
 
@@ -110,15 +117,48 @@ class BallTracker:
         frame_idx = frame_detections.frame_idx
 
         if frame_detections.balls:
-            # Use highest-confidence ball detection
-            best_ball = max(frame_detections.balls, key=lambda d: d.confidence)
-            cx, cy = best_ball.center
-
             if self._last_detection_frame < 0:
-                # First detection — initialize state
+                # First detection ever — pick highest confidence, initialize
+                best_ball = max(frame_detections.balls, key=lambda d: d.confidence)
+                cx, cy = best_ball.center
                 self._kf.x = np.array([cx, cy, 0, 0], dtype=float)
             else:
+                # Predict where ball should be
                 self._kf.predict()
+                pred_x, pred_y = float(self._kf.x[0]), float(self._kf.x[1])
+
+                gap = frame_idx - self._last_detection_frame
+                reacquiring = gap > self.config.reacquire_after_gap_frames
+
+                best_ball = None
+                best_score = -1.0
+                max_jump = self.config.max_ball_jump_px
+
+                for det in frame_detections.balls:
+                    dcx, dcy = det.center
+                    dist = ((dcx - pred_x) ** 2 + (dcy - pred_y) ** 2) ** 0.5
+
+                    if not reacquiring and dist > max_jump:
+                        continue
+
+                    proximity = max(0.0, 1.0 - dist / max_jump) if max_jump > 0 else 1.0
+                    w = self.config.ball_gate_weight
+                    score = (1.0 - w) * det.confidence + w * proximity
+
+                    if score > best_score:
+                        best_score = score
+                        best_ball = det
+
+                if best_ball is None:
+                    # All detections rejected — use prediction if within gap window
+                    if gap <= self.config.max_ball_gap_frames:
+                        px, py = int(self._kf.x[0]), int(self._kf.x[1])
+                        pos = BallPosition(frame_idx=frame_idx, x=px, y=py, predicted=True)
+                        self._positions.append(pos)
+                        return pos
+                    return None
+
+                cx, cy = best_ball.center
                 self._kf.update(np.array([cx, cy], dtype=float))
 
             self._last_detection_frame = frame_idx
@@ -236,7 +276,13 @@ class BallTracker:
         return shots
 
     def _find_arcs(self, hoop_pos: tuple[int, int] | None) -> list[ShotEvent]:
-        """Find ball arc trajectories that look like shot attempts."""
+        """Find ball arc trajectories that look like shot attempts.
+
+        Applies multiple validation gates beyond the basic arc height check:
+        - Maximum arc duration (rejects overly long arcs from tracking noise)
+        - Minimum descent ratio (ball must fall significantly after peak)
+        - Hoop-directed descent (ball's descent must be near the hoop horizontally)
+        """
         shots = []
         positions = self._positions
 
@@ -261,7 +307,39 @@ class BallTracker:
                     arc_height = positions[arc_start].y - min_y
 
                     if arc_height >= self.config.shot_min_arc_height_px:
-                        arc_positions = positions[arc_start : arc_end + 1]
+                        arc_len = arc_end - arc_start + 1
+
+                        # Gate A: Maximum arc duration
+                        if arc_len > self.config.shot_max_arc_frames:
+                            i = arc_end
+                            break
+
+                        # Gate B: Minimum descent ratio
+                        descent_height = curr_y - min_y
+                        d_ratio = descent_height / arc_height if arc_height > 0 else 0.0
+                        if d_ratio < self.config.shot_min_descent_ratio:
+                            i = arc_end
+                            break
+
+                        # Gate C: Hoop-directed descent
+                        hoop_x_dist: float | None = None
+                        if hoop_pos is not None:
+                            hoop_x = hoop_pos[0]
+                            descent_positions = positions[peak_idx : arc_end + 1]
+                            if descent_positions:
+                                descent_median_x = int(np.median([p.x for p in descent_positions]))
+                                hoop_x_dist = float(abs(descent_median_x - hoop_x))
+                                # Estimate frame width from tracked positions
+                                all_x = [p.x for p in positions]
+                                frame_w = max(max(all_x) - min(all_x), 640)
+                                max_x_dist = frame_w * self.config.shot_hoop_x_range_ratio
+                                if hoop_x_dist > max_x_dist:
+                                    i = arc_end
+                                    break
+
+                        # Tighten event window: start at most shot_pre_peak_frames before peak
+                        effective_start = max(arc_start, peak_idx - self.config.shot_pre_peak_frames)
+                        arc_positions = positions[effective_start : arc_end + 1]
 
                         # Try bbox-based check first, fall back to center proximity
                         made = False
@@ -275,7 +353,7 @@ class BallTracker:
 
                         shots.append(
                             ShotEvent(
-                                start_frame=positions[arc_start].frame_idx,
+                                start_frame=positions[effective_start].frame_idx,
                                 end_frame=positions[arc_end].frame_idx,
                                 made=made,
                                 ball_positions=arc_positions,
@@ -283,6 +361,8 @@ class BallTracker:
                                 hoop_x=hoop_pos[0] if hoop_pos else None,
                                 hoop_y=hoop_pos[1] if hoop_pos else None,
                                 hoop_bbox=hoop_bbox,
+                                hoop_x_distance=hoop_x_dist,
+                                descent_ratio=d_ratio,
                             )
                         )
 

@@ -254,15 +254,18 @@ class TestEndToEnd:
         config = TrackingConfig(shot_min_arc_height_px=150, hoop_proximity_px=1000)
         tracker = BallTracker(config)
 
-        # Arc far from hoop bbox but within a huge proximity radius
+        # Arc near hoop horizontally (passes hoop-directed gate) but doesn't
+        # descend through the bbox.  With hoop_proximity_px=1000 the fallback
+        # proximity check would say "made", but the bbox check should win.
         positions = _make_arc_positions(
-            start_frame=0, start_x=100, start_y=350, peak_y=100, end_y=350,
+            start_frame=0, start_x=500, start_y=350, peak_y=100, end_y=350,
             num_points=12,
         )
         tracker._positions = positions
 
-        # Hoop bbox far to the right — ball shouldn't pass through it
-        hoop = _make_hoop_observation(frame_idx=6, x1=800, y1=200, x2=900, y2=230)
+        # Hoop bbox offset to the right — ball is close enough for Gate C but
+        # outside the bbox horizontal tolerance
+        hoop = _make_hoop_observation(frame_idx=6, x1=700, y1=200, x2=800, y2=230)
         tracker.set_hoop_observations([hoop])
 
         shots = tracker.find_shots()

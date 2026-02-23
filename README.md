@@ -87,8 +87,8 @@ python -m src.cli --timeline my_game_timeline.json -o my_game_analysis.json
 
 The analyzer processes each clip's used portion, running:
 - **YOLO object detection** — finds the basketball, hoop, and players in each frame
-- **Ball tracking** — follows the ball across frames with a Kalman filter, detects shot arcs
-- **Shot detection** — determines if the ball passes through the hoop (made shot vs. miss)
+- **Ball tracking** — follows the ball across frames with a spatially-gated Kalman filter (rejects false detections far from predicted position)
+- **Shot detection** — validates arcs against multiple gates (duration, descent quality, hoop direction) and determines made vs. miss
 - **Player tracking** — tracks players with DeepSORT, classifies teams by jersey color
 - **Crowd excitement** — analyzes audio mel-spectrograms in the 500–4000 Hz band for roar peaks
 - **Whistle detection** — finds referee whistles via spectral peaks in the 2000–4500 Hz band
@@ -230,10 +230,10 @@ Options:
 ```
 Video file ──┬──► Scene Detection (PySceneDetect)
              │
-             ├──► Object Detection (YOLO) ──► Ball Tracking (Kalman filter)
+             ├──► Object Detection (YOLO) ──► Ball Tracking (spatially-gated Kalman filter)
              │                                       │
              │                                       ├──► Shot Detection
-             │                                       │    (arc trajectory + hoop proximity)
+             │                                       │    (arc validation + hoop-directed descent)
              │                                       │
              ├──► Player Tracking (DeepSORT) ──► Team Classification
              │                                   (jersey color k-means)

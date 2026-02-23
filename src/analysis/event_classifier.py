@@ -90,6 +90,14 @@ class EventClassifier:
         if shot.arc_height_px > 150:
             video_conf = min(1.0, video_conf + 0.1)
 
+        # Boost for arcs whose descent lands near the hoop
+        if shot.hoop_x_distance is not None and shot.hoop_x_distance < 50:
+            video_conf = min(1.0, video_conf + 0.1)
+
+        # Boost for clean descent (ball fell well past peak)
+        if shot.descent_ratio is not None and shot.descent_ratio > 0.7:
+            video_conf = min(1.0, video_conf + 0.05)
+
         # Check for corroborating audio
         audio_conf = self._find_audio_correlation(start_sec, end_sec, audio_events)
 

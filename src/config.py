@@ -46,6 +46,13 @@ class TrackingConfig:
     hoop_proximity_px: int = 80  # pixels from hoop center to count as "through hoop"
     hoop_x_tolerance_ratio: float = 0.3  # horizontal tolerance as fraction of hoop bbox width
     hoop_entry_y_margin_px: int = 30  # vertical margin above/below hoop top for entry detection
+    max_ball_jump_px: int = 200  # max pixel distance from predicted position to accept a detection
+    ball_gate_weight: float = 0.5  # blend factor: 0=pure confidence, 1=pure proximity-to-prediction
+    reacquire_after_gap_frames: int = 5  # after this many missed frames, accept any detection
+    shot_hoop_x_range_ratio: float = 0.5  # max horizontal distance from hoop (as fraction of frame width)
+    shot_min_descent_ratio: float = 0.4  # ball must descend at least this fraction of ascent height
+    shot_max_arc_frames: int = 90  # max tracked positions in a single arc (~3s at 30fps/skip-2)
+    shot_pre_peak_frames: int = 15  # max frames before peak to include in shot event window
     deepsort_max_age: int = 30
     deepsort_n_init: int = 3
     enable_player_tracking: bool = True  # set False to skip DeepSORT player tracking

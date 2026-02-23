@@ -83,16 +83,42 @@ A 4-dimensional linear Kalman filter (from `filterpy`) tracks the ball's positio
 - **Measurement noise (R):** Diagonal matrix scaled by `kalman_measurement_noise` (default 0.1)
 - **Initial covariance (P):** Scaled by 10.0
 
-When a ball detection exists, the filter predicts then updates with the measured center of the highest-confidence detection. When no detection exists but the gap is within `max_ball_gap_frames` (default 10), the filter predicts only, producing an interpolated position marked as `predicted=True`.
+### Spatially-Gated Detection
+
+Rather than simply selecting the highest-confidence ball detection per frame, the tracker uses the Kalman filter's predicted position to gate incoming detections. Each candidate is scored by a weighted blend of detection confidence and proximity to the predicted position:
+
+```
+score = (1 - ball_gate_weight) * confidence + ball_gate_weight * proximity
+```
+
+where `proximity = max(0, 1 - distance / max_ball_jump_px)`. Detections beyond `max_ball_jump_px` (default 200px) from the predicted position are rejected outright. This prevents false-positive ball detections on the far side of the frame from hijacking the trajectory.
+
+After an extended tracking gap (more than `reacquire_after_gap_frames` frames with no accepted detection), the distance gate is disabled to allow the tracker to re-lock onto any detection.
+
+When all detections in a frame are rejected, the tracker falls back to Kalman prediction if still within `max_ball_gap_frames` (default 10), producing an interpolated position marked as `predicted=True`.
 
 ### Shot Arc Detection
 
-Shot detection runs as a second pass over the full tracked trajectory. The algorithm:
+Shot detection runs as a second pass over the full tracked trajectory. The algorithm applies multiple validation gates:
 
 1. Scan positions with a sliding window looking for upward motion (decreasing y in image coordinates)
 2. Track the peak (minimum y value) of the arc
-3. When the ball descends past the peak by at least `shot_min_arc_height_px` (default 50px), record the arc
+3. When the ball descends past the peak by at least `shot_min_arc_height_px` (default 50px), record the arc candidate
 4. Compute `arc_height = start_y - peak_y`; only accept if it exceeds the minimum threshold
+5. **Maximum arc duration gate**: Reject arcs spanning more than `shot_max_arc_frames` (default 90 positions, ~3 seconds at 30fps with frame_skip=2). Real basketball shots take 1-2 seconds; longer arcs indicate tracking noise or continuous ball movement.
+6. **Minimum descent ratio gate**: The ball must descend at least `shot_min_descent_ratio` (default 0.4) of its ascent height after the peak. This filters partial arcs where the ball barely crosses the threshold.
+7. **Hoop-directed descent gate**: When a hoop position is known, the median x-coordinate of the ball during the descent phase must be within `shot_hoop_x_range_ratio` (default 0.5) of the frame width from the hoop's x-coordinate. This distinguishes shots (aimed at the hoop) from passes (aimed at teammates elsewhere on the court).
+
+The event time window is also tightened: instead of spanning from where the sliding window first detected upward motion, the shot event starts at most `shot_pre_peak_frames` (default 15, ~0.5s) before the arc peak. The arc height is still calculated from the original start for correctness, but the reported event window covers only the shot flight.
+
+### Shot Quality Metrics
+
+During arc validation, two quality metrics are computed and stored on each `ShotEvent`:
+
+- `hoop_x_distance`: Pixel distance between the descent median x-coordinate and the hoop x-coordinate. Lower values indicate the ball was aimed directly at the hoop.
+- `descent_ratio`: The ratio of descent height to ascent height. Higher values indicate a cleaner parabolic arc.
+
+These metrics are used downstream by the event classifier to adjust confidence scores.
 
 ### Made Shot Detection
 
@@ -214,6 +240,8 @@ For each `ShotEvent` from the ball tracker:
    - Made shot: 0.7
    - Missed shot: 0.5
    - Bonus +0.1 (capped at 1.0) for arcs taller than 150px
+   - Bonus +0.1 if `hoop_x_distance < 50px` (descent lands near the hoop)
+   - Bonus +0.05 if `descent_ratio > 0.7` (clean parabolic descent)
 2. **Audio correlation:** Search for audio events in a window from **1 second before** to **4 seconds after** the shot (crowd reaction lags the play). Crowd excitement scores are taken directly; whistle scores are scaled by 0.8.
 3. **Fusion:** Apply the weighted formula above
 4. **Filter:** Only events with `confidence >= min_confidence` (default 0.7) are kept
@@ -312,6 +340,13 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `hoop_proximity_px` | `int` | `80` | Distance (pixels) to count as through hoop |
 | `hoop_x_tolerance_ratio` | `float` | `0.3` | Horizontal tolerance as fraction of hoop bbox width |
 | `hoop_entry_y_margin_px` | `int` | `30` | Vertical margin above/below hoop top for entry detection |
+| `max_ball_jump_px` | `int` | `200` | Max pixel distance from predicted position to accept a detection |
+| `ball_gate_weight` | `float` | `0.5` | Blend factor for gated detection: 0=pure confidence, 1=pure proximity |
+| `reacquire_after_gap_frames` | `int` | `5` | After this many missed frames, disable distance gate for re-acquisition |
+| `shot_hoop_x_range_ratio` | `float` | `0.5` | Max horizontal distance from hoop (as fraction of frame width) for arc validation |
+| `shot_min_descent_ratio` | `float` | `0.4` | Ball must descend at least this fraction of ascent height |
+| `shot_max_arc_frames` | `int` | `90` | Max tracked positions in a single arc (~3s at 30fps/skip-2) |
+| `shot_pre_peak_frames` | `int` | `15` | Max frames before peak to include in shot event window |
 | `deepsort_max_age` | `int` | `30` | Frames before dropping unmatched track |
 | `deepsort_n_init` | `int` | `3` | Detections needed to confirm a track |
 | `enable_player_tracking` | `bool` | `True` | Set `False` to skip DeepSORT player tracking (`--no-players`) |
