@@ -306,10 +306,11 @@ class TestLayupDetection:
         config = TrackingConfig(shot_min_arc_height_px=50)
         tracker = BallTracker(config)
 
-        # arc_height = 400 - 200 = 200, arc-end triggers at 200+50=250
-        # descent_height at trigger ~= 50, d_ratio ~= 50/200 = 0.25
+        # Ball carried from y=400 up to y=150 (above hoop at y=200), then
+        # short descent through hoop to y=280.
+        # arc_height = 400 - 150 = 250, d_ratio ~= 65/250 = 0.26
         positions = _make_layup_positions(
-            start_y=400, peak_y=200, end_y=280,
+            start_y=400, peak_y=150, end_y=280,
             ascent_frames=15, descent_frames=5,
         )
         tracker._positions = positions
@@ -330,7 +331,7 @@ class TestLayupDetection:
         tracker = BallTracker(config)
 
         positions = _make_layup_positions(
-            start_y=400, peak_y=200, end_y=280,
+            start_y=400, peak_y=150, end_y=280,
             ascent_frames=15, descent_frames=5,
         )
         tracker._positions = positions
