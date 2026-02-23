@@ -64,7 +64,8 @@ class ObjectDetector:
 
     def __init__(self, config: VideoConfig | None = None, device: str = "auto", detect_players: bool = True):
         self.config = config or VideoConfig()
-        self.model = YOLO(self.config.yolo_model)
+        model_path = self._resolve_model_path(self.config.yolo_model)
+        self.model = YOLO(model_path)
         self._is_custom = self._check_custom_model()
         self._device = self._resolve_device(device)
         self._detect_players = detect_players
@@ -76,6 +77,20 @@ class ObjectDetector:
             self.config.yolo_model, self._is_custom, self._device,
             self.config.roboflow_model_id or "none",
         )
+
+    @staticmethod
+    def _resolve_model_path(model: str) -> str:
+        """Resolve a bare model filename to the models/ directory."""
+        model_p = Path(model)
+        if model_p.exists() or "/" in model or "\\" in model:
+            return model
+        models_dir = Path(__file__).resolve().parents[2] / "models"
+        local = models_dir / model
+        if local.exists():
+            return str(local)
+        # Bare name that doesn't exist yet — download into models/
+        models_dir.mkdir(parents=True, exist_ok=True)
+        return str(local)
 
     @staticmethod
     def _resolve_device(device: str) -> str:
