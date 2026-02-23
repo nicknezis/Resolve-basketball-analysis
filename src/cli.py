@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--device",
-        choices=["auto", "cuda", "cpu"],
+        choices=["auto", "cuda", "mps", "cpu"],
         default="auto",
         help="Compute device (default: auto)",
     )

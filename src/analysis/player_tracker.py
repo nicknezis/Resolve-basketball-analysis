@@ -15,18 +15,63 @@ from src.config import TrackingConfig
 logger = logging.getLogger(__name__)
 
 
-def _gpu_available(device: str = "auto") -> bool:
-    """Check if a GPU backend is available for PyTorch."""
+def _resolve_embedder_device(device: str = "auto") -> str:
+    """Determine the best available device for the DeepSORT embedder.
+
+    Returns one of ``"cuda"``, ``"mps"``, or ``"cpu"``.
+    """
     if device == "cpu":
-        return False
+        return "cpu"
     try:
         import torch
         if device == "cuda":
-            return torch.cuda.is_available()
-        # "auto" — prefer CUDA, then MPS (Apple Silicon)
-        return torch.cuda.is_available() or torch.backends.mps.is_available()
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "mps":
+            return "mps" if torch.backends.mps.is_available() else "cpu"
+        # "auto" — prefer CUDA, then MPS (Apple Silicon), then CPU
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
     except Exception:
-        return False
+        return "cpu"
+
+
+def _migrate_embedder_to_mps(tracker: DeepSort) -> None:
+    """Move the DeepSORT embedder model to MPS and patch inference.
+
+    The ``deep-sort-realtime`` library only supports CUDA for GPU.  This
+    works around that by moving the CPU-loaded model to MPS and replacing
+    ``predict`` so batches are sent to the MPS device.
+    """
+    import torch
+    from deep_sort_realtime.embedder.embedder_pytorch import batch as _batch
+
+    embedder = getattr(tracker, "embedder", None)
+    if embedder is None:
+        return
+
+    device = torch.device("mps")
+    embedder.model.to(device)
+    embedder.model.half()
+    embedder.gpu = True
+    embedder.half = True
+
+    def _predict_mps(np_images: list) -> list:
+        all_feats = []
+        preproc_imgs = [embedder.preprocess(img) for img in np_images]
+        for this_batch in _batch(preproc_imgs, bs=embedder.max_batch_size):
+            this_batch = torch.cat(this_batch, dim=0).to(device).half()
+            output = embedder.model.forward(this_batch)
+            all_feats.extend(output.cpu().data.numpy())
+        return all_feats
+
+    embedder.predict = _predict_mps
+
+    # Warmup on MPS
+    embedder.predict([np.zeros((100, 100, 3), dtype=np.uint8)])
+    logger.info("Migrated DeepSORT embedder to MPS (Apple Silicon GPU)")
 
 
 @dataclass
@@ -58,22 +103,29 @@ class PlayerTracker:
 
     def __init__(self, config: TrackingConfig | None = None, device: str = "auto"):
         self.config = config or TrackingConfig()
-        self._gpu = _gpu_available(device)
-        self._tracker = DeepSort(
-            max_age=self.config.deepsort_max_age,
-            n_init=self.config.deepsort_n_init,
-            embedder_gpu=self._gpu,
-        )
+        self._device = _resolve_embedder_device(device)
+        self._tracker = self._create_tracker()
         self._color_samples: dict[int, list[np.ndarray]] = {}  # track_id -> HSV samples
         self._tracks: dict[int, TrackedPlayer] = {}
+        logger.info("PlayerTracker using device: %s", self._device)
+
+    def _create_tracker(self) -> DeepSort:
+        """Create a DeepSort tracker, migrating embedder to MPS if needed."""
+        # CUDA: let the library handle GPU natively.
+        # MPS: construct on CPU, then migrate model + inference.
+        use_library_gpu = self._device == "cuda"
+        tracker = DeepSort(
+            max_age=self.config.deepsort_max_age,
+            n_init=self.config.deepsort_n_init,
+            embedder_gpu=use_library_gpu,
+        )
+        if self._device == "mps":
+            _migrate_embedder_to_mps(tracker)
+        return tracker
 
     def reset(self) -> None:
         """Reset tracker for a new video or scene."""
-        self._tracker = DeepSort(
-            max_age=self.config.deepsort_max_age,
-            n_init=self.config.deepsort_n_init,
-            embedder_gpu=self._gpu,
-        )
+        self._tracker = self._create_tracker()
         self._color_samples = {}
         self._tracks = {}
 
