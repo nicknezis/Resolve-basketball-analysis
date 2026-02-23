@@ -208,8 +208,7 @@ class ClipReview:
 
         det_lookup = {fd.frame_idx: fd for fd in all_detections}
         ball_lookup = {bp.frame_idx: bp for bp in ball_positions}
-        hoop_pos = self._compute_median_hoop(all_detections)
-        return lut, cap, det_lookup, ball_lookup, hoop_pos
+        return lut, cap, det_lookup, ball_lookup
 
     def _render_overlays(
         self,
@@ -222,7 +221,6 @@ class ClipReview:
         game_events: list[GameEvent],
         ball_positions: list[BallPosition],
         ball_lookup: dict[int, BallPosition],
-        hoop_pos: tuple[int, int] | None,
         max_resolution: int = 0,
     ) -> tuple[np.ndarray, float]:
         """Render all analysis overlays onto a frame. Returns (canvas, scale).
@@ -245,14 +243,13 @@ class ClipReview:
 
         fd = det_lookup.get(frame_idx)
 
-        # Draw median hoop position
-        if hoop_pos:
-            hx, hy = int(hoop_pos[0] * coord_scale), int(hoop_pos[1] * coord_scale)
-            cv2.rectangle(canvas, (hx - 30, hy - 20), (hx + 30, hy + 20), COLOR_HOOP, 2)
-            _put_label(canvas, "hoop", hx - 30, hy - 26, COLOR_HOOP)
-
-        # Draw player bounding boxes
         if fd:
+            # Draw per-frame hoop bounding box
+            if fd.hoops:
+                best_hoop = max(fd.hoops, key=lambda d: d.confidence)
+                _draw_bbox(canvas, best_hoop.bbox, COLOR_HOOP, label="hoop", scale=coord_scale)
+
+            # Draw player bounding boxes
             for det in fd.players:
                 _draw_bbox(canvas, det.bbox, COLOR_PLAYER, scale=coord_scale)
 
@@ -320,7 +317,7 @@ class ClipReview:
         )
         if result is None:
             return
-        lut, cap, det_lookup, ball_lookup, hoop_pos = result
+        lut, cap, det_lookup, ball_lookup = result
 
         writer = None
         total = end_frame - start_frame
@@ -339,7 +336,7 @@ class ClipReview:
             canvas, scale = self._render_overlays(
                 frame, frame_idx, start_frame, end_frame,
                 det_lookup, shot_events, game_events,
-                ball_positions, ball_lookup, hoop_pos,
+                ball_positions, ball_lookup,
                 max_resolution=max_resolution,
             )
 
@@ -415,7 +412,7 @@ class ClipReview:
         )
         if result is None:
             return
-        lut, cap, det_lookup, ball_lookup, hoop_pos = result
+        lut, cap, det_lookup, ball_lookup = result
 
         delay = max(1, int(1000 / fps)) if fps > 0 else 33
         paused = False
@@ -431,7 +428,7 @@ class ClipReview:
             canvas, scale = self._render_overlays(
                 frame, frame_idx, start_frame, end_frame,
                 det_lookup, shot_events, game_events,
-                ball_positions, ball_lookup, hoop_pos,
+                ball_positions, ball_lookup,
                 max_resolution=max_resolution,
             )
 
@@ -475,20 +472,6 @@ class ClipReview:
         cv2.destroyWindow(self._window_name)
         for _ in range(4):
             cv2.waitKey(1)
-
-    @staticmethod
-    def _compute_median_hoop(detections: list[FrameDetections]) -> tuple[int, int] | None:
-        """Compute median hoop position across all detections."""
-        hoop_positions = []
-        for fd in detections:
-            if fd.hoops:
-                best = max(fd.hoops, key=lambda d: d.confidence)
-                hoop_positions.append(best.center)
-        if not hoop_positions:
-            return None
-        hx = int(np.median([p[0] for p in hoop_positions]))
-        hy = int(np.median([p[1] for p in hoop_positions]))
-        return (hx, hy)
 
     @staticmethod
     def _draw_timeline_bar(
