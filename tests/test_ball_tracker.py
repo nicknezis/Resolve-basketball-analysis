@@ -343,6 +343,76 @@ class TestLayupDetection:
         assert len(shots) == 0, "Old threshold 0.4 should reject this layup arc"
 
 
+class TestBackboardShot:
+    """Tests for backboard shots where trajectory reverses at the board."""
+
+    @staticmethod
+    def _make_backboard_positions(
+        x: int = 450,
+        start_frame: int = 0,
+    ) -> list[BallPosition]:
+        """Generate a backboard shot trajectory.
+
+        Ball rises to y=100 (well above hoop at y=200), hits backboard and
+        bounces down to y=160 (arc-end triggers at y > 100+50=150). The ball
+        is still above the hoop margin (170) at arc_end, so the through-hoop
+        transition (y crossing from <=170 to >=200) only appears in the
+        post-arc extension window.
+        """
+        positions: list[BallPosition] = []
+        frame = start_frame
+
+        # Ascent toward backboard: y=400 → 100
+        for y in range(400, 99, -25):
+            positions.append(BallPosition(frame_idx=frame, x=x, y=y, predicted=False))
+            frame += 1
+
+        # Backboard bounce: ball descends y=120 → 160
+        # Arc-end triggers at y=160 (> 100 + 50 = 150)
+        for y in [120, 140, 160]:
+            positions.append(BallPosition(frame_idx=frame, x=x, y=y, predicted=False))
+            frame += 1
+
+        # Post-arc: ball continues through hoop (y=180 → 300)
+        # Through-hoop transition: above (y<=170) → at/below (y>=200)
+        for y in [180, 200, 220, 250, 280, 300]:
+            positions.append(BallPosition(frame_idx=frame, x=x, y=y, predicted=False))
+            frame += 1
+
+        return positions
+
+    def test_backboard_shot_detected_as_made(self):
+        """Backboard bounce: arc ends at bounce, extended window catches hoop."""
+        config = TrackingConfig(shot_min_arc_height_px=50)
+        tracker = BallTracker(config)
+
+        positions = self._make_backboard_positions()
+        tracker._positions = positions
+
+        # Hoop at y_top=200 (ball must cross from above 170 to at/below 200)
+        hoop = _make_hoop_observation(frame_idx=15, x1=400, y1=200, x2=500, y2=230)
+        tracker.set_hoop_observations([hoop])
+
+        shots = tracker.find_shots()
+        assert len(shots) >= 1, "Backboard shot should be detected"
+        assert shots[0].made is True, "Extended window should catch through-hoop after bounce"
+
+    def test_backboard_shot_missed_without_extension(self):
+        """Without post-arc extension, backboard shot is detected but not made."""
+        config = TrackingConfig(shot_min_arc_height_px=50, shot_post_arc_frames=0)
+        tracker = BallTracker(config)
+
+        positions = self._make_backboard_positions()
+        tracker._positions = positions
+
+        hoop = _make_hoop_observation(frame_idx=15, x1=400, y1=200, x2=500, y2=230)
+        tracker.set_hoop_observations([hoop])
+
+        shots = tracker.find_shots()
+        assert len(shots) >= 1, "Arc should still be detected"
+        assert shots[0].made is False, "Without extension, through-hoop is missed"
+
+
 class TestHoopObservationDataclass:
     """Basic tests for the HoopObservation dataclass."""
 

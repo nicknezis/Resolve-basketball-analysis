@@ -359,15 +359,30 @@ class BallTracker:
                         effective_start = max(arc_start, peak_idx - self.config.shot_pre_peak_frames)
                         arc_positions = positions[effective_start : arc_end + 1]
 
+                        # Extend window for made-shot check to capture backboard
+                        # bounces where the ball goes through the hoop after the
+                        # main arc descent triggers
+                        made_end = min(
+                            arc_end + self.config.shot_post_arc_frames,
+                            len(positions) - 1,
+                        )
+                        made_positions = positions[effective_start : made_end + 1]
+
                         # Try bbox-based check first, fall back to center proximity
                         made = False
                         hoop_bbox = None
                         if self._hoop_observations:
                             made, hoop_bbox = self._check_ball_through_hoop_bbox(
-                                arc_positions, self._hoop_observations,
+                                made_positions, self._hoop_observations,
                             )
                         elif hoop_pos:
-                            made = self._check_through_hoop(arc_positions, hoop_pos)
+                            made = self._check_through_hoop(made_positions, hoop_pos)
+
+                        # Include extended positions in event if made via
+                        # the post-arc window (e.g. backboard bounce)
+                        if made and made_end > arc_end:
+                            arc_positions = made_positions
+                            arc_end = made_end
 
                         logger.debug(
                             "Arc accepted: frames %d-%d, arc_height=%d, d_ratio=%.3f, made=%s",

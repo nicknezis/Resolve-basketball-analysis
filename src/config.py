@@ -53,6 +53,7 @@ class TrackingConfig:
     shot_min_descent_ratio: float = 0.15  # ball must descend at least this fraction of ascent height (low to allow layups)
     shot_max_arc_frames: int = 90  # max tracked positions in a single arc (~3s at 30fps/skip-2)
     shot_pre_peak_frames: int = 15  # max frames before peak to include in shot event window
+    shot_post_arc_frames: int = 10  # extra frames past arc_end to check for made shot (backboard bounces)
     deepsort_max_age: int = 30
     deepsort_n_init: int = 3
     enable_player_tracking: bool = True  # set False to skip DeepSORT player tracking

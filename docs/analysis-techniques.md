@@ -111,6 +111,8 @@ Shot detection runs as a second pass over the full tracked trajectory. The algor
 
 The event time window is also tightened: instead of spanning from where the sliding window first detected upward motion, the shot event starts at most `shot_pre_peak_frames` (default 15, ~0.5s) before the arc peak. The arc height is still calculated from the original start for correctness, but the reported event window covers only the shot flight.
 
+For made-shot detection, the search window extends `shot_post_arc_frames` (default 10) positions past the arc end. This captures backboard shots where the ball's descent triggers the arc end at the backboard bounce, but the actual through-hoop transition happens a few frames later. If a made shot is found in the extended window, the event window is expanded to include those positions.
+
 ### Shot Quality Metrics
 
 During arc validation, two quality metrics are computed and stored on each `ShotEvent`:
@@ -347,6 +349,7 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `shot_min_descent_ratio` | `float` | `0.15` | Ball must descend at least this fraction of ascent height (low for layups) |
 | `shot_max_arc_frames` | `int` | `90` | Max tracked positions in a single arc (~3s at 30fps/skip-2) |
 | `shot_pre_peak_frames` | `int` | `15` | Max frames before peak to include in shot event window |
+| `shot_post_arc_frames` | `int` | `10` | Extra frames past arc_end to check for made shot (backboard bounces) |
 | `deepsort_max_age` | `int` | `30` | Frames before dropping unmatched track |
 | `deepsort_n_init` | `int` | `3` | Detections needed to confirm a track |
 | `enable_player_tracking` | `bool` | `True` | Set `False` to skip DeepSORT player tracking (`--no-players`) |
