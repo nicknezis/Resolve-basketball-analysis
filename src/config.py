@@ -17,6 +17,14 @@ class VideoConfig:
     input_lut: Path | None = None  # path to .cube 3D LUT file (or .zip/.lut containing one)
     roboflow_model_id: str | None = None  # Roboflow model ID (e.g. "basketball-detection/1")
     roboflow_confidence: float = 0.5  # confidence threshold for Roboflow hoop model
+    detector_backend: str = "yolo"  # "yolo" or "rfdetr"
+    rfdetr_model_size: str = "small"  # "nano", "small", "medium", "large", "xlarge", "2xlarge"
+    rfdetr_weights: str | None = None  # path to fine-tuned .pth checkpoint
+    rfdetr_num_classes: int | None = None  # number of classes (None = COCO default)
+    rfdetr_class_names: list[str] | None = None  # class names matching dataset indices
+    rfdetr_resolution: int | None = None  # input resolution (must be divisible by 56)
+    nms_enabled: bool = False  # apply supervision NMS deduplication
+    nms_threshold: float = 0.5  # IoU threshold for NMS
 
 
 @dataclass
@@ -54,6 +62,10 @@ class TrackingConfig:
     shot_max_arc_frames: int = 90  # max tracked positions in a single arc (~3s at 30fps/skip-2)
     shot_pre_peak_frames: int = 15  # max frames before peak to include in shot event window
     shot_post_arc_frames: int = 10  # extra frames past arc_end to check for made shot (backboard bounces)
+    consensus_required: int = 1  # min detections in window to confirm ball (1=disabled)
+    consensus_window: int = 5  # rolling window size for consensus check
+    consensus_max_spread_px: int = 100  # max spatial spread for consensus candidates
+    use_polygon_zone: bool = False  # use supervision PolygonZone for made-shot fallback
     deepsort_max_age: int = 30
     deepsort_n_init: int = 3
     enable_player_tracking: bool = True  # set False to skip DeepSORT player tracking

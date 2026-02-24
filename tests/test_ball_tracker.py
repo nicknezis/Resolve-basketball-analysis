@@ -427,3 +427,104 @@ class TestHoopObservationDataclass:
         assert obs.bbox == (100, 200, 300, 250)
         assert obs.center == (200, 225)
         assert obs.confidence == 0.85
+
+
+class TestMultiFrameConsensus:
+    """Tests for the multi-frame consensus filter."""
+
+    def test_consensus_blocks_single_spurious_detection(self):
+        """A single ball detection should not start tracking when consensus=3."""
+        config = TrackingConfig(consensus_required=3, consensus_window=5)
+        tracker = BallTracker(config)
+
+        fd = FrameDetections(frame_idx=0)
+        fd.balls.append(Detection(
+            class_name="sports ball", confidence=0.9,
+            bbox=(200, 200, 220, 220), frame_idx=0,
+        ))
+        result = tracker.update(fd)
+        assert result is None
+
+        # Several frames with no ball
+        for i in range(1, 5):
+            fd_empty = FrameDetections(frame_idx=i)
+            result = tracker.update(fd_empty)
+            assert result is None
+
+    def test_consensus_confirms_after_n_frames(self):
+        """Three consistent detections in 5 frames should confirm tracking."""
+        config = TrackingConfig(consensus_required=3, consensus_window=5)
+        tracker = BallTracker(config)
+
+        result = None
+        for i in range(3):
+            fd = FrameDetections(frame_idx=i)
+            fd.balls.append(Detection(
+                class_name="sports ball", confidence=0.8,
+                bbox=(100 + i, 100 + i, 120 + i, 120 + i), frame_idx=i,
+            ))
+            result = tracker.update(fd)
+
+        assert result is not None
+        assert result.predicted is False
+
+    def test_consensus_rejects_spatially_spread_detections(self):
+        """Detections spread beyond max_spread_px should not confirm."""
+        config = TrackingConfig(
+            consensus_required=3, consensus_window=5, consensus_max_spread_px=50,
+        )
+        tracker = BallTracker(config)
+
+        positions = [(100, 100), (300, 100), (200, 300)]
+        for i, (x, y) in enumerate(positions):
+            fd = FrameDetections(frame_idx=i)
+            fd.balls.append(Detection(
+                class_name="sports ball", confidence=0.8,
+                bbox=(x - 10, y - 10, x + 10, y + 10), frame_idx=i,
+            ))
+            result = tracker.update(fd)
+
+        assert result is None
+
+    def test_consensus_disabled_with_default_config(self):
+        """With consensus_required=1 (default), first detection is accepted."""
+        config = TrackingConfig()
+        tracker = BallTracker(config)
+
+        fd = FrameDetections(frame_idx=0)
+        fd.balls.append(Detection(
+            class_name="sports ball", confidence=0.9,
+            bbox=(100, 100, 120, 120), frame_idx=0,
+        ))
+        result = tracker.update(fd)
+        assert result is not None
+
+    def test_consensus_resets_after_long_gap(self):
+        """After ball is lost for max_ball_gap_frames, consensus must re-establish."""
+        config = TrackingConfig(
+            consensus_required=3, consensus_window=5, max_ball_gap_frames=5,
+        )
+        tracker = BallTracker(config)
+
+        # Establish tracking
+        for i in range(3):
+            fd = FrameDetections(frame_idx=i)
+            fd.balls.append(Detection(
+                class_name="sports ball", confidence=0.9,
+                bbox=(100, 100, 120, 120), frame_idx=i,
+            ))
+            tracker.update(fd)
+
+        # Gap of 20 frames with no ball — exceeds max_ball_gap_frames
+        for i in range(3, 23):
+            fd = FrameDetections(frame_idx=i)
+            tracker.update(fd)
+
+        # New detection should NOT be immediately accepted
+        fd = FrameDetections(frame_idx=23)
+        fd.balls.append(Detection(
+            class_name="sports ball", confidence=0.9,
+            bbox=(500, 500, 520, 520), frame_idx=23,
+        ))
+        result = tracker.update(fd)
+        assert result is None

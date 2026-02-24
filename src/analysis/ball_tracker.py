@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 from filterpy.kalman import KalmanFilter
 
-from src.analysis.object_detector import FrameDetections
+from src.analysis.object_detector import Detection, FrameDetections
 from src.config import TrackingConfig
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,16 @@ class BallPosition:
     x: int
     y: int
     predicted: bool  # True if interpolated/predicted rather than detected
+
+
+@dataclass
+class _ConsensusCandidate:
+    """A candidate ball detection pending consensus confirmation."""
+
+    frame_idx: int
+    x: int
+    y: int
+    confidence: float
 
 
 @dataclass
@@ -64,6 +74,8 @@ class BallTracker:
         self._positions: list[BallPosition] = []
         self._last_detection_frame: int = -1
         self._hoop_observations: list[HoopObservation] = []
+        self._consensus_buffer: list[_ConsensusCandidate] = []
+        self._consensus_confirmed: bool = False
 
     def _init_kalman(self) -> KalmanFilter:
         """Initialize a 2D position+velocity Kalman filter."""
@@ -99,6 +111,89 @@ class BallTracker:
         self._positions = []
         self._last_detection_frame = -1
         self._hoop_observations = []
+        self._consensus_buffer = []
+        self._consensus_confirmed = False
+
+    def _select_best_ball(
+        self, frame_detections: FrameDetections, frame_idx: int,
+    ) -> Detection | None:
+        """Select the best ball detection using confidence+proximity scoring.
+
+        Returns None if all detections are rejected by the distance gate.
+        """
+        if not frame_detections.balls:
+            return None
+
+        if self._last_detection_frame < 0:
+            return max(frame_detections.balls, key=lambda d: d.confidence)
+
+        self._kf.predict()
+        pred_x, pred_y = float(self._kf.x[0]), float(self._kf.x[1])
+
+        gap = frame_idx - self._last_detection_frame
+        reacquiring = gap > self.config.reacquire_after_gap_frames
+
+        best_ball = None
+        best_score = -1.0
+        max_jump = self.config.max_ball_jump_px
+
+        for det in frame_detections.balls:
+            dcx, dcy = det.center
+            dist = ((dcx - pred_x) ** 2 + (dcy - pred_y) ** 2) ** 0.5
+
+            if not reacquiring and dist > max_jump:
+                continue
+
+            proximity = max(0.0, 1.0 - dist / max_jump) if max_jump > 0 else 1.0
+            w = self.config.ball_gate_weight
+            score = (1.0 - w) * det.confidence + w * proximity
+
+            if score > best_score:
+                best_score = score
+                best_ball = det
+
+        return best_ball
+
+    def _handle_consensus(
+        self, frame_idx: int, cx: int, cy: int, confidence: float,
+    ) -> BallPosition | None:
+        """Build consensus before committing to a ball track.
+
+        Collects candidates in a rolling window.  Once N out of M frames
+        have detections within ``consensus_max_spread_px`` of each other,
+        consensus is confirmed and the Kalman filter is initialized.
+        """
+        self._consensus_buffer.append(
+            _ConsensusCandidate(frame_idx=frame_idx, x=cx, y=cy, confidence=confidence)
+        )
+
+        window = self.config.consensus_window
+        if len(self._consensus_buffer) > window:
+            self._consensus_buffer = self._consensus_buffer[-window:]
+
+        candidates = self._consensus_buffer
+        if len(candidates) >= self.config.consensus_required:
+            xs = [c.x for c in candidates]
+            ys = [c.y for c in candidates]
+            spread = max(max(xs) - min(xs), max(ys) - min(ys))
+
+            if spread <= self.config.consensus_max_spread_px:
+                self._consensus_confirmed = True
+                best = max(candidates, key=lambda c: c.confidence)
+                self._kf.x = np.array([best.x, best.y, 0, 0], dtype=float)
+                self._last_detection_frame = frame_idx
+
+                for c in candidates:
+                    self._positions.append(BallPosition(
+                        frame_idx=c.frame_idx, x=c.x, y=c.y, predicted=False,
+                    ))
+
+                self._consensus_buffer = []
+                # The current frame's candidate is already in the candidates
+                # list, so return the last appended position.
+                return self._positions[-1]
+
+        return None
 
     def update(self, frame_detections: FrameDetections) -> BallPosition | None:
         """Process detections for one frame and return tracked ball position.
@@ -107,6 +202,9 @@ class BallTracker:
         confidence and proximity to the Kalman filter's predicted position.
         Detections beyond ``max_ball_jump_px`` are rejected unless the tracker
         is re-acquiring after an extended gap.
+
+        When ``consensus_required > 1``, new ball tracks must be confirmed by
+        multiple consistent detections before the Kalman filter is initialized.
 
         Args:
             frame_detections: Detections for this frame from ObjectDetector.
@@ -117,48 +215,31 @@ class BallTracker:
         frame_idx = frame_detections.frame_idx
 
         if frame_detections.balls:
+            best_ball = self._select_best_ball(frame_detections, frame_idx)
+
+            if best_ball is None:
+                # All detections rejected by distance gate
+                if (
+                    self._last_detection_frame >= 0
+                    and (frame_idx - self._last_detection_frame) <= self.config.max_ball_gap_frames
+                ):
+                    px, py = int(self._kf.x[0]), int(self._kf.x[1])
+                    pos = BallPosition(frame_idx=frame_idx, x=px, y=py, predicted=True)
+                    self._positions.append(pos)
+                    return pos
+                return None
+
+            cx, cy = best_ball.center
+
+            # Consensus gate: require multiple detections before committing
+            if not self._consensus_confirmed:
+                return self._handle_consensus(frame_idx, cx, cy, best_ball.confidence)
+
+            # Normal tracking — consensus already confirmed
             if self._last_detection_frame < 0:
-                # First detection ever — pick highest confidence, initialize
-                best_ball = max(frame_detections.balls, key=lambda d: d.confidence)
-                cx, cy = best_ball.center
                 self._kf.x = np.array([cx, cy, 0, 0], dtype=float)
             else:
-                # Predict where ball should be
                 self._kf.predict()
-                pred_x, pred_y = float(self._kf.x[0]), float(self._kf.x[1])
-
-                gap = frame_idx - self._last_detection_frame
-                reacquiring = gap > self.config.reacquire_after_gap_frames
-
-                best_ball = None
-                best_score = -1.0
-                max_jump = self.config.max_ball_jump_px
-
-                for det in frame_detections.balls:
-                    dcx, dcy = det.center
-                    dist = ((dcx - pred_x) ** 2 + (dcy - pred_y) ** 2) ** 0.5
-
-                    if not reacquiring and dist > max_jump:
-                        continue
-
-                    proximity = max(0.0, 1.0 - dist / max_jump) if max_jump > 0 else 1.0
-                    w = self.config.ball_gate_weight
-                    score = (1.0 - w) * det.confidence + w * proximity
-
-                    if score > best_score:
-                        best_score = score
-                        best_ball = det
-
-                if best_ball is None:
-                    # All detections rejected — use prediction if within gap window
-                    if gap <= self.config.max_ball_gap_frames:
-                        px, py = int(self._kf.x[0]), int(self._kf.x[1])
-                        pos = BallPosition(frame_idx=frame_idx, x=px, y=py, predicted=True)
-                        self._positions.append(pos)
-                        return pos
-                    return None
-
-                cx, cy = best_ball.center
                 self._kf.update(np.array([cx, cy], dtype=float))
 
             self._last_detection_frame = frame_idx
@@ -173,6 +254,11 @@ class BallTracker:
             px, py = int(self._kf.x[0]), int(self._kf.x[1])
             pos = BallPosition(frame_idx=frame_idx, x=px, y=py, predicted=True)
         else:
+            # Ball lost — reset consensus so re-acquisition must re-confirm
+            if self._last_detection_frame >= 0:
+                self._consensus_confirmed = False
+                self._consensus_buffer = []
+                self._last_detection_frame = -1
             return None
 
         self._positions.append(pos)
@@ -368,13 +454,20 @@ class BallTracker:
                         )
                         made_positions = positions[effective_start : made_end + 1]
 
-                        # Try bbox-based check first, fall back to center proximity
+                        # Try bbox-based check first, then polygon zone fallback,
+                        # then center proximity
                         made = False
                         hoop_bbox = None
                         if self._hoop_observations:
                             made, hoop_bbox = self._check_ball_through_hoop_bbox(
                                 made_positions, self._hoop_observations,
                             )
+                            if not made and self.config.use_polygon_zone:
+                                best_obs = self._get_nearest_hoop_observation(made_positions)
+                                if best_obs is not None:
+                                    made = self._check_ball_in_hoop_zone(made_positions, best_obs)
+                                    if made:
+                                        hoop_bbox = best_obs.bbox
                         elif hoop_pos:
                             made = self._check_through_hoop(made_positions, hoop_pos)
 
@@ -487,3 +580,61 @@ class BallTracker:
                 return True, best_obs.bbox
 
         return False, None
+
+    def _get_nearest_hoop_observation(
+        self, positions: list[BallPosition],
+    ) -> HoopObservation | None:
+        """Find the hoop observation nearest in time to the given positions."""
+        if not positions or not self._hoop_observations:
+            return None
+        mid_frame = (positions[0].frame_idx + positions[-1].frame_idx) / 2
+        return min(self._hoop_observations, key=lambda o: abs(o.frame_idx - mid_frame))
+
+    def _check_ball_in_hoop_zone(
+        self,
+        positions: list[BallPosition],
+        hoop_observation: HoopObservation,
+    ) -> bool:
+        """Check if ball positions fall within a polygon zone around the hoop.
+
+        Constructs a trapezoidal polygon from the hoop bounding box that
+        extends downward to account for the net area.  Requires the
+        ``supervision`` package; returns False if not available.
+        """
+        try:
+            import supervision as sv
+        except ImportError:
+            return False
+
+        hx1, hy1, hx2, hy2 = hoop_observation.bbox
+        hoop_w = hx2 - hx1
+        hoop_h = hy2 - hy1
+        margin = hoop_w * self.config.hoop_x_tolerance_ratio
+        net_depth = int(hoop_h * 1.5)
+
+        polygon = np.array([
+            [hx1 - margin, hy1 - self.config.hoop_entry_y_margin_px],
+            [hx2 + margin, hy1 - self.config.hoop_entry_y_margin_px],
+            [hx2 + margin * 0.5, hy2 + net_depth],
+            [hx1 - margin * 0.5, hy2 + net_depth],
+        ], dtype=np.int32)
+
+        zone = sv.PolygonZone(polygon=polygon)
+
+        # Check descent positions (after peak)
+        peak_idx = min(range(len(positions)), key=lambda k: positions[k].y)
+        descent = positions[peak_idx:]
+        if len(descent) < 2:
+            return False
+
+        xyxy = np.array([
+            [p.x - 5, p.y - 5, p.x + 5, p.y + 5] for p in descent
+        ], dtype=np.float32)
+        ball_dets = sv.Detections(
+            xyxy=xyxy,
+            confidence=np.ones(len(descent), dtype=np.float32),
+            class_id=np.zeros(len(descent), dtype=int),
+        )
+
+        mask = zone.trigger(ball_dets)
+        return bool(np.any(mask))

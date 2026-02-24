@@ -124,6 +124,55 @@ def main(argv: list[str] | None = None) -> int:
         help="Confidence threshold for Roboflow hoop model (default: 0.4)",
     )
     parser.add_argument(
+        "--detector",
+        choices=["yolo", "rfdetr"],
+        default="yolo",
+        help="Detection model backend (default: yolo)",
+    )
+    parser.add_argument(
+        "--rfdetr-size",
+        choices=["nano", "small", "medium", "large", "xlarge", "2xlarge"],
+        default="small",
+        help="RF-DETR model size (default: small). Only used with --detector rfdetr.",
+    )
+    parser.add_argument(
+        "--rfdetr-weights",
+        type=str,
+        default=None,
+        help="Path to fine-tuned RF-DETR checkpoint (.pth file)",
+    )
+    parser.add_argument(
+        "--rfdetr-classes",
+        type=str,
+        default=None,
+        help="Comma-separated class names for fine-tuned RF-DETR model "
+        "(e.g., 'ball,ball-in-basket,number,player,...,referee,rim')",
+    )
+    parser.add_argument(
+        "--rfdetr-resolution",
+        type=int,
+        default=None,
+        help="RF-DETR input resolution (must be divisible by 56)",
+    )
+    parser.add_argument(
+        "--nms",
+        action="store_true",
+        help="Enable NMS deduplication (requires supervision library)",
+    )
+    parser.add_argument(
+        "--nms-threshold",
+        type=float,
+        default=0.5,
+        help="IoU threshold for NMS deduplication (default: 0.5)",
+    )
+    parser.add_argument(
+        "--consensus",
+        type=int,
+        default=1,
+        help="Multi-frame consensus: min detections to confirm ball tracking "
+        "(1=disabled, 3 recommended; default: 1)",
+    )
+    parser.add_argument(
         "--device",
         choices=["auto", "cuda", "mps", "cpu"],
         default="auto",
@@ -197,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # Build config from CLI args
+    rfdetr_classes = args.rfdetr_classes.split(",") if args.rfdetr_classes else None
     config = AnalysisConfig(
         video=VideoConfig(
             yolo_model=args.yolo_model,
@@ -205,12 +255,21 @@ def main(argv: list[str] | None = None) -> int:
             input_lut=args.input_lut,
             roboflow_model_id=args.roboflow_model,
             roboflow_confidence=args.roboflow_confidence,
+            detector_backend=args.detector,
+            rfdetr_model_size=args.rfdetr_size,
+            rfdetr_weights=args.rfdetr_weights,
+            rfdetr_class_names=rfdetr_classes,
+            rfdetr_num_classes=len(rfdetr_classes) if rfdetr_classes else None,
+            rfdetr_resolution=args.rfdetr_resolution,
+            nms_enabled=args.nms,
+            nms_threshold=args.nms_threshold,
         ),
         audio=AudioConfig(
             excitement_threshold=args.crowd_threshold,
         ),
         tracking=TrackingConfig(
             enable_player_tracking=not args.no_players,
+            consensus_required=args.consensus,
         ),
         events=EventConfig(
             min_confidence=args.min_confidence,
