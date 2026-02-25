@@ -323,15 +323,15 @@ def _analyze_clip(
             # Player tracking needs the original frame for color sampling
             tracking = player_tracker.update(frame, fd) if player_tracker else None
 
-            # Live preview rendering
+            # Live preview rendering (use clip-relative indices for display)
             if preview_active and frame_preview is not None:
                 preview_active = frame_preview.render(
                     frame=frame_resized,
                     detections=fd,
                     ball_position=ball_pos,
                     tracking=tracking,
-                    frame_idx=frame_idx,
-                    total_frames=source_end,
+                    frame_idx=frame_idx - source_start,
+                    total_frames=total_source_frames,
                 )
 
         frame_idx += 1
@@ -368,6 +368,14 @@ def _analyze_clip(
                 whistle_events = detect_whistles(trimmed_path, config.audio)
                 audio_events = crowd_events + whistle_events
                 audio_events.sort(key=lambda e: e.start_sec)
+
+                # Shift audio timestamps from clip-relative (0-based from
+                # the trimmed WAV) to source-relative so they align with
+                # shot event frame numbers for audio-video correlation.
+                audio_offset_sec = source_start / media_fps
+                for ae in audio_events:
+                    ae.start_sec += audio_offset_sec
+                    ae.end_sec += audio_offset_sec
             finally:
                 trimmed_path.unlink(missing_ok=True)
         finally:

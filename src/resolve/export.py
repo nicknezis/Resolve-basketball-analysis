@@ -106,6 +106,31 @@ def _timecode_to_frames(tc: str, fps: float) -> int:
     return int((h * 3600 + m * 60 + s) * fps + f)
 
 
+def _compute_source_range(
+    left_offset: int,
+    tl_duration: int,
+    media_fps: float,
+    timeline_fps: float,
+) -> tuple[int, int, int]:
+    """Compute file-relative source frame range from timeline clip info.
+
+    Args:
+        left_offset: Frames trimmed from left of source media (file-relative,
+            in media frame rate).
+        tl_duration: Clip duration in timeline frames.
+        media_fps: Source media frame rate.
+        timeline_fps: Timeline frame rate.
+
+    Returns:
+        Tuple of (source_start_frame, source_end_frame, source_duration_frames),
+        all in media-fps frame space and file-relative.
+    """
+    source_start_frame = left_offset
+    source_duration_frames = int(tl_duration * media_fps / timeline_fps)
+    source_end_frame = source_start_frame + source_duration_frames
+    return source_start_frame, source_end_frame, source_duration_frames
+
+
 def export_timeline(
     output_path: Path | None = None,
     prefer_proxy: bool = False,
@@ -258,13 +283,13 @@ def _extract_clip_info(
         source_start_tc = mpi.GetClipProperty("Start") or ""
         source_end_tc = mpi.GetClipProperty("End") or ""
 
-        # Calculate the source frame range that this clip uses
-        # MediaPoolItem "Start" is the very beginning of the source file
-        # The actual in-point on the timeline = source start + left_offset
-        media_start_frame = _timecode_to_frames(source_start_tc, media_fps)
-        source_start_frame = media_start_frame + left_offset
-        source_end_frame = source_start_frame + tl_duration
-        source_duration_frames = tl_duration
+        # Calculate the file-relative source frame range this clip uses.
+        # left_offset is already file-relative (frames from file start to
+        # the in-point).  tl_duration is in timeline frames and must be
+        # converted to media frames when the frame rates differ.
+        source_start_frame, source_end_frame, source_duration_frames = (
+            _compute_source_range(left_offset, tl_duration, media_fps, timeline_fps)
+        )
 
         # Full source file duration
         source_total_duration = mpi.GetClipProperty("Duration") or ""
