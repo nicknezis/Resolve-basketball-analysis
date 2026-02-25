@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from src.analysis.audio_analyzer import AudioEvent
 from src.resolve.export import _compute_source_range
 
@@ -131,7 +129,7 @@ def test_audio_video_correlation_window_overlaps():
     Shot at source frame 2000 (at 30fps = 66.67s).
     Audio event at clip-relative 5.0s from a clip starting at source frame 1800
     (= source time 60.0s).  After offset: audio at 60.0 + 5.0 = 65.0s.
-    Correlation window for shot: [65.67s, 72.67s] should overlap audio at 65.0s.
+    Correlation window for shot: [65.67s, 71.67s] should overlap audio at 65.0s.
     """
     source_start = 1800
     media_fps = 30.0
