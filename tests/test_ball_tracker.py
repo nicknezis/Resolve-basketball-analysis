@@ -486,6 +486,30 @@ class TestMultiFrameConsensus:
 
         assert result is None
 
+    def test_consensus_rejects_detections_spread_across_too_many_frames(self):
+        """Spatially-consistent but temporally sparse detections must not confirm.
+
+        Three detections at the same location but at frames 0, 100, 200 fall
+        outside the consensus_window, so they should never confirm a track even
+        though their spatial spread is zero.
+        """
+        config = TrackingConfig(
+            consensus_required=3, consensus_window=5, consensus_max_spread_px=50,
+            max_ball_gap_frames=1000,
+        )
+        tracker = BallTracker(config)
+
+        result = None
+        for frame in (0, 100, 200):
+            fd = FrameDetections(frame_idx=frame)
+            fd.balls.append(Detection(
+                class_name="sports ball", confidence=0.9,
+                bbox=(100, 100, 120, 120), frame_idx=frame,
+            ))
+            result = tracker.update(fd)
+
+        assert result is None
+
     def test_consensus_disabled_with_default_config(self):
         """With consensus_required=1 (default), first detection is accepted."""
         config = TrackingConfig()

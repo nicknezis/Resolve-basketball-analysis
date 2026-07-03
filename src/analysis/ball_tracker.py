@@ -167,9 +167,14 @@ class BallTracker:
             _ConsensusCandidate(frame_idx=frame_idx, x=cx, y=cy, confidence=confidence)
         )
 
+        # Expire candidates by frame age, not buffer length, so consensus
+        # reflects "N detections within the last M frames".  A count-based
+        # trim would let sparse detections spread across arbitrarily many
+        # frames (e.g. 0, 100, 200) confirm consensus.
         window = self.config.consensus_window
-        if len(self._consensus_buffer) > window:
-            self._consensus_buffer = self._consensus_buffer[-window:]
+        self._consensus_buffer = [
+            c for c in self._consensus_buffer if frame_idx - c.frame_idx < window
+        ]
 
         candidates = self._consensus_buffer
         if len(candidates) >= self.config.consensus_required:
@@ -239,7 +244,8 @@ class BallTracker:
             if self._last_detection_frame < 0:
                 self._kf.x = np.array([cx, cy, 0, 0], dtype=float)
             else:
-                self._kf.predict()
+                # _select_best_ball() already advanced the filter with
+                # predict(); only apply the measurement update here.
                 self._kf.update(np.array([cx, cy], dtype=float))
 
             self._last_detection_frame = frame_idx

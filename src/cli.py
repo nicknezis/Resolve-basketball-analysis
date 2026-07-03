@@ -246,7 +246,11 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # Build config from CLI args
-    rfdetr_classes = args.rfdetr_classes.split(",") if args.rfdetr_classes else None
+    rfdetr_classes = (
+        [c.strip() for c in args.rfdetr_classes.split(",") if c.strip()]
+        if args.rfdetr_classes
+        else None
+    ) or None
     config = AnalysisConfig(
         video=VideoConfig(
             yolo_model=args.yolo_model,
