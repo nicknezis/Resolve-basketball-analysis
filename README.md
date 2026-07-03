@@ -176,6 +176,7 @@ Input:
   --input-lut PATH         3D LUT (.cube or .zip/.lut archive) for log footage
 
 Detection:
+  --detector {yolo,rfdetr} Detection model backend (default: yolo)
   --yolo-model NAME        YOLO model name or path (default: yolo11m.pt)
   --yolo-confidence FLOAT  Detection confidence threshold (default: 0.5)
   --roboflow-model ID      Roboflow model for hoop + ball detection
@@ -183,6 +184,20 @@ Detection:
   --roboflow-confidence F  Roboflow confidence threshold (default: 0.5)
   --frame-skip N           Analyze every Nth frame (default: 2)
   --no-players             Disable player detection and tracking (faster)
+
+RF-DETR backend (only used with --detector rfdetr; see "Detection Backends"):
+  --rfdetr-size SIZE       nano|small|medium|large|xlarge|2xlarge (default: small)
+  --rfdetr-weights PATH    Path to an RF-DETR checkpoint (.pth). Omit to
+                           auto-download the base COCO weights for the size.
+  --rfdetr-classes NAMES   Comma-separated class names for a fine-tuned model,
+                           in dataset index order (e.g. ball,hoop,player,...)
+  --rfdetr-resolution N    Input resolution, must be divisible by 56
+
+Detection post-processing (both backends):
+  --nms                    Deduplicate overlapping boxes via supervision NMS
+  --nms-threshold FLOAT    IoU threshold for NMS (default: 0.5)
+  --consensus N            Require N consistent ball detections before starting
+                           a track (1=disabled, 3 recommended; default: 1)
 
 Classification:
   --min-confidence FLOAT   Minimum event confidence to report (default: 0.7)
@@ -220,6 +235,58 @@ Options:
   --min-confidence FLOAT   Only import events above this confidence (default: 0.0)
   -v, --verbose            Enable debug logging
 ```
+
+---
+
+## Detection Backends & Model Weights
+
+The analyzer supports two detection backends, selected with `--detector`:
+
+| Backend | Flag | Weights | Auto-download? |
+|---------|------|---------|----------------|
+| **YOLO** (default) | `--detector yolo` | `yolo11m.pt` (or `--yolo-model`) | Yes — Ultralytics downloads on first run and caches it |
+| **RF-DETR** | `--detector rfdetr` | base COCO checkpoint per `--rfdetr-size`, or `--rfdetr-weights PATH` | Base COCO weights only |
+
+Both backends can be combined with `--nms` (deduplicate overlapping boxes),
+`--consensus N` (require N consistent ball detections before starting a track),
+and `--roboflow-model` (supplemental hoop/ball detection).
+
+### RF-DETR weights
+
+RF-DETR requires the optional dependency: `pip install rfdetr supervision`
+(or `pip install -e ".[rfdetr]"`).
+
+- **Base COCO weights (auto-downloaded).** Running `--detector rfdetr` *without*
+  `--rfdetr-weights` constructs the model for the chosen `--rfdetr-size`, and the
+  `rfdetr` package downloads that size's COCO-pretrained checkpoint into its own
+  cache — the same way YOLO auto-downloads `yolo11m.pt`. Nothing in this repo
+  downloads weights; it only passes a path through to the library.
+- **Explicit checkpoint.** `--rfdetr-weights ./rf-detr-small.pth` loads a specific
+  `.pth` file. This repo does **not** ship or fetch that file — you place it
+  yourself (e.g. a copy of the library's base checkpoint, or a checkpoint you
+  trained).
+
+> **COCO weights ≠ basketball classes.** A COCO-pretrained RF-DETR checkpoint
+> detects the 80 generic COCO classes (`person`, `sports ball`) — the same
+> categories YOLO already provides. To get dedicated `ball` / `hoop` / `rim` /
+> `player` classes in one pass you need a checkpoint **fine-tuned on a basketball
+> dataset**, loaded with `--rfdetr-weights` *and* described with `--rfdetr-classes`
+> (names in dataset-index order). Roboflow's
+> [Basketball Player Detection dataset](https://universe.roboflow.com/roboflow-jvuqo/basketball-player-detection-3-ycjdo)
+> and [RF-DETR fine-tuning notebooks](https://colab.research.google.com/github/roboflow/rf-detr)
+> are the starting point for producing such a checkpoint. Without `--rfdetr-classes`,
+> class IDs are interpreted as COCO indices.
+
+Example — fine-tuned RF-DETR with the 10-class basketball dataset:
+
+```bash
+basketball-analyze --timeline timeline.json --clip 0 \
+  --detector rfdetr --rfdetr-weights ./basketball-rfdetr.pth \
+  --rfdetr-classes ball,ball-in-basket,number,player,player-in-possession,player-jump-shot,player-layup-dunk,player-shot-block,referee,rim \
+  --nms --consensus 3 -o analysis.json
+```
+
+`.pt` and `.pth` weight files are gitignored — keep them out of the repo.
 
 ---
 
@@ -282,7 +349,7 @@ Resolve-basketball-analysis/
 │   ├── analysis/                    # Standalone analysis engine
 │   │   ├── video_analyzer.py        # Pipeline orchestrator (single + timeline modes)
 │   │   ├── audio_analyzer.py        # Crowd excitement + whistle detection
-│   │   ├── object_detector.py       # YOLO + Roboflow detection (ball, hoop, players)
+│   │   ├── object_detector.py       # YOLO / RF-DETR + Roboflow detection (ball, hoop, players)
 │   │   ├── ball_tracker.py          # Kalman filter tracking + shot detection
 │   │   ├── player_tracker.py        # DeepSORT tracking + team color classification
 │   │   ├── scene_detector.py        # PySceneDetect wrapper
@@ -370,3 +437,9 @@ All detection thresholds live in `src/config.py` and can be tuned without modify
 
 **YOLO downloads a model on first run**
 - This is normal. Ultralytics auto-downloads the model weights the first time. Subsequent runs use the cached file.
+
+**RF-DETR: `ImportError: The 'rfdetr' package is required`**
+- The RF-DETR backend is optional. Install it with `pip install rfdetr supervision` (or `pip install -e ".[rfdetr]"`).
+
+**RF-DETR detects `person`/`sports ball` instead of `ball`/`hoop`/`player`**
+- You're running COCO-pretrained weights, which only know the 80 COCO classes. Load a basketball fine-tuned checkpoint with `--rfdetr-weights` and pass the class names via `--rfdetr-classes` (in dataset-index order). See [Detection Backends & Model Weights](#detection-backends--model-weights).

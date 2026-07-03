@@ -8,6 +8,7 @@ build/
 
 # Model weights (large binary files)
 *.pt
+*.pth
 models/*.onnx
 models/*.engine
 
