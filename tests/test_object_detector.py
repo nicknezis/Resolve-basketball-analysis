@@ -9,9 +9,12 @@ import numpy as np
 from src.analysis.object_detector import (
     BASKETBALL_DETECTION_CLASSES,
     COCO_NAMES,
+    ROLE_BALL_IN_BASKET,
+    ROLE_HOOP,
     Detection,
     FrameDetections,
     ObjectDetector,
+    class_role,
 )
 from src.config import VideoConfig
 
@@ -169,4 +172,59 @@ class TestCategorizeCustomExtended:
 
     def test_ignored_classes(self):
         assert self._categorize("number") is None
-        assert self._categorize("referee") is None
+        assert self._categorize("referee") is None  # kept in fd.referees, not players
+
+    def test_referee_goes_to_referees_bucket(self):
+        fd = FrameDetections(frame_idx=0)
+        det = Detection(class_name="referee", confidence=0.9, bbox=(0, 0, 10, 10), frame_idx=0)
+        ObjectDetector._categorize_custom(det, "referee", fd)
+        assert fd.referees == [det] and fd.players == []
+
+    def test_ball_in_basket_is_both_ball_and_signal(self):
+        fd = FrameDetections(frame_idx=0)
+        det = Detection(class_name="ball-in-basket", confidence=0.9, bbox=(0, 0, 10, 10), frame_idx=0)
+        ObjectDetector._categorize_custom(det, "ball-in-basket", fd)
+        assert fd.balls == [det] and fd.balls_in_basket == [det]
+
+
+class TestClassRoles:
+    def test_normalises_case_and_underscores(self):
+        assert class_role("Ball_In_Basket") == ROLE_BALL_IN_BASKET
+        assert class_role(" RIM ") == ROLE_HOOP
+        assert class_role("Sports Ball") == "ball"
+
+    def test_unknown_is_none(self):
+        assert class_role("scoreboard") is None
+
+    def test_custom_model_detection_by_hoop_role(self):
+        """A YOLO model with a 'rim' class is custom even without 'basketball'."""
+        with patch.object(ObjectDetector, "__init__", lambda self, *a, **kw: None):
+            det = ObjectDetector.__new__(ObjectDetector)
+        det.model = MagicMock()
+        det.model.names = {0: "ball", 1: "player", 2: "rim"}
+        assert det._check_custom_model() is True
+        det.model.names = {0: "person", 32: "sports ball"}
+        assert det._check_custom_model() is False
+
+
+class TestPerRoleThresholds:
+    def _detector(self, **cfg):
+        with patch.object(ObjectDetector, "__init__", lambda self, *a, **kw: None):
+            det = ObjectDetector.__new__(ObjectDetector)
+        det.config = VideoConfig(**cfg)
+        det._is_custom = True
+        return det
+
+    def test_hoop_uses_looser_floor(self):
+        det = self._detector(yolo_confidence=0.5, hoop_confidence=0.3)
+        fd = FrameDetections(frame_idx=0)
+        det._categorize(Detection("rim", 0.35, (0, 0, 10, 10), 0), fd, base_conf=0.5)
+        det._categorize(Detection("ball", 0.35, (0, 0, 10, 10), 0), fd, base_conf=0.5)
+        assert len(fd.hoops) == 1
+        assert fd.balls == []
+
+    def test_hoop_below_floor_dropped(self):
+        det = self._detector(hoop_confidence=0.3)
+        fd = FrameDetections(frame_idx=0)
+        det._categorize(Detection("hoop", 0.2, (0, 0, 10, 10), 0), fd, base_conf=0.5)
+        assert fd.hoops == []

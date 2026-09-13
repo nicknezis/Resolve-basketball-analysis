@@ -103,15 +103,18 @@ Shot detection runs as a second pass over the full tracked trajectory. The algor
 
 1. Scan positions with a sliding window looking for upward motion (decreasing y in image coordinates)
 2. Track the peak (minimum y value) of the arc
-3. When the ball descends past the peak by at least `shot_min_arc_height_px` (default 50px), record the arc candidate
-4. Compute `arc_height = start_y - peak_y`; only accept if it exceeds the minimum threshold
-5. **Maximum arc duration gate**: Reject arcs spanning more than `shot_max_arc_frames` (default 90 positions, ~3 seconds at 30fps with frame_skip=2). Real basketball shots take 1-2 seconds; longer arcs indicate tracking noise or continuous ball movement.
+3. When a **detected** (not Kalman-predicted) position descends past the peak by at least `shot_arc_end_descent_px` (default 50px), record the arc candidate. Predicted positions never terminate an arc — extrapolation must not manufacture a descent.
+4. Compute `arc_height = start_y - peak_y`; only accept if it exceeds `shot_min_arc_height_px` (default 50px)
+5. **Maximum arc duration gate**: Reject arcs whose source-frame span exceeds `shot_max_arc_sec` (default 3.0 s). Real basketball shots take 1-2 seconds; longer arcs indicate tracking noise or continuous ball movement.
 6. **Minimum descent ratio gate**: The ball must descend at least `shot_min_descent_ratio` (default 0.15) of its ascent height after the peak. This is set low to accommodate layups, where the player carries the ball upward (inflating the measured ascent) but the actual descent through the hoop is short. Jump shots produce ratios near 1.0; layups typically produce 0.15-0.35.
-7. **Hoop-directed descent gate**: When a hoop position is known, the median x-coordinate of the ball during the descent phase must be within `shot_hoop_x_range_ratio` (default 0.5) of the frame width from the hoop's x-coordinate. This distinguishes shots (aimed at the hoop) from passes (aimed at teammates elsewhere on the court).
+7. **Hoop-directed descent gate**: When a hoop position is known, the median x-coordinate of the ball during the descent phase must be within `shot_hoop_x_range_ratio` (default 0.35) of the analysed frame width from the hoop's x-coordinate. This distinguishes shots (aimed at the hoop) from passes (aimed at teammates elsewhere on the court).
+8. **Peak-above-rim gate** (`shot_require_peak_above_rim`, default on): when a rim observation is available for the arc, the arc's peak must be at or above the rim top (minus `shot_peak_rim_margin_px`, default 20). Passes, dribbles and hand-offs also trace up-and-down arcs, but they stay below rim height; a ball that enters the rim must have been above it. This gate removed about half of the false attempts on the reference footage.
 
-The event time window is also tightened: instead of spanning from where the sliding window first detected upward motion, the shot event starts at most `shot_pre_peak_frames` (default 15, ~0.5s) before the arc peak. The arc height is still calculated from the original start for correctness, but the reported event window covers only the shot flight.
+**Everything is measured in source frames, never list indices.** The tracked position list is sparse — nothing is appended while the ball is lost — so two positions adjacent in the list can be many seconds apart in the video. A gap larger than `max_ball_gap_frames` between consecutive positions terminates the current arc: a ball that was lost and re-acquired elsewhere is not one trajectory. (Before this rule a single "shot" could span 11 s of footage and swallow several real shots.)
 
-For made-shot detection, the search window extends `shot_post_arc_frames` (default 10) positions past the arc end. This captures backboard shots where the ball's descent triggers the arc end at the backboard bounce, but the actual through-hoop transition happens a few frames later. If a made shot is found in the extended window, the event window is expanded to include those positions.
+The event time window is also tightened: instead of spanning from where the sliding window first detected upward motion, the shot event starts at most `shot_pre_peak_sec` (default 0.5 s) before the arc peak. The arc height is still calculated from the original start for correctness, but the reported event window covers only the shot flight.
+
+For made-shot detection, the search window extends `shot_post_arc_sec` (default 0.35 s) past the arc end, but never across a track break. This captures backboard shots where the ball's descent triggers the arc end at the backboard bounce, but the actual through-hoop transition happens a few frames later. If a made shot is found in the extended window, the event window is expanded to include those positions.
 
 ### Shot Quality Metrics
 
@@ -124,7 +127,13 @@ These metrics are used downstream by the event classifier to adjust confidence s
 
 ### Made Shot Detection
 
-If hoop detections exist, the median hoop position across all frames is computed. A shot is classified as "made" if any ball position during the arc passes within `hoop_proximity_px` (default 80px) Euclidean distance of the median hoop center.
+`ShotEvent.made` is **tri-state**: `True`, `False`, or `None` when no usable hoop observation exists for the shot. "No rim in view" is reported as unknown, never as a miss, and the classifier gives it a lower base confidence.
+
+1. **Rim selection.** Per-frame hoop observations (bbox + centre) are collected during detection. For a given descent, only observations within `hoop_obs_max_age_frames` (default 30) of the descent window are eligible — with a panning camera, a rim seen 20 s earlier says nothing about where the rim is now. When both baskets are in view, the observation horizontally nearest the descent (within two rim-widths) wins, then the one nearest in time. The selected rim also feeds the hoop-directed gate.
+2. **Bbox crossing** (`made_via="bbox"`). The descent must contain a position clearly above the rim top (`hoop_entry_y_margin_px`) followed by a later position at/below it, both within the rim's horizontal extent expanded by `hoop_x_tolerance_ratio`.
+3. **Polygon zone** (`made_via="polygon"`, opt-in via `--polygon-zone`). A trapezoid from the rim box down through the net; a descent position inside it counts as a make. Requires `supervision`.
+4. **Ball-in-basket** (`made_via="ball_in_basket"`). If the detector emits a `ball-in-basket` class (e.g. the Roboflow 10-class basketball model) between the arc peak and the end of the post-arc window, the shot is a make regardless of geometry.
+5. **Centre proximity** (`made_via="proximity"`) is the legacy fallback used only when hoop *centres* were supplied without boxes (`set_hoop_positions`): any position within `hoop_proximity_px` of the median centre.
 
 ---
 
@@ -225,28 +234,33 @@ Each detected scene stores start/end frame numbers and start/end timestamps in s
 
 ### Multi-Modal Fusion
 
-Video and audio signals are combined using a weighted linear fusion:
+Video is the primary signal; audio can only raise a shot's confidence into the remaining headroom:
 
 ```
-fused_confidence = video_weight * video_conf + audio_weight * audio_conf
+fused_confidence = video_conf + audio_weight * audio_conf * (1 - video_conf)
 ```
 
-- `video_weight` = 0.6 (default)
 - `audio_weight` = 0.4 (default)
+
+Audio is therefore never *required*: a clean made shot in a silent gym still passes. (The previous `0.6·video + 0.4·audio` formula made it mathematically impossible for any shot to be reported without crowd noise, because the best video-only score was 0.57 against a 0.7 threshold.)
 
 ### Shot Event Classification
 
 For each `ShotEvent` from the ball tracker:
 
-1. **Base video confidence:**
-   - Made shot: 0.7
-   - Missed shot: 0.5
-   - Bonus +0.1 (capped at 1.0) for arcs taller than 150px
-   - Bonus +0.1 if `hoop_x_distance < 50px` (descent lands near the hoop)
+1. **Base video confidence** by hoop evidence:
+   - `made is True` (ball seen through the rim): **0.85**
+   - `made is False` (rim in view, ball did not go through): **0.70**
+   - `made is None` (no rim to judge against): **0.55**
+   - Bonus +0.05 for arcs taller than 150px
+   - Bonus +0.05 if `hoop_x_distance < 50px` (descent lands near the hoop)
    - Bonus +0.05 if `descent_ratio > 0.7` (clean parabolic descent)
+   - capped at 1.0
 2. **Audio correlation:** Search for audio events in a window from **1 second before** to **4 seconds after** the shot (crowd reaction lags the play). Crowd excitement scores are taken directly; whistle scores are scaled by 0.8.
-3. **Fusion:** Apply the weighted formula above
-4. **Filter:** Only events with `confidence >= min_confidence` (default 0.7) are kept
+3. **Fusion:** Apply the formula above
+4. **Filter:** `video_confidence >= min_video_confidence` (default 0.5) **and** `confidence >= min_confidence` (default 0.7). With the defaults, shots with hoop evidence pass on video alone; hoop-less arcs still need corroborating audio.
+
+Each shot event carries `details.made` (`true`/`false`/`null`), `details.made_via`, `details.hoop_x_distance` and the arc height.
 
 ### Standalone Crowd Events
 
@@ -254,7 +268,7 @@ High crowd excitement peaks not explained by any shot event (not overlapping wit
 
 ### Event Merging
 
-After classification, events are sorted by time and adjacent events of the **same type** with a gap smaller than `merge_gap_sec` (default 2.0s) are merged. The merged event spans from the earliest start to the latest end, and takes the maximum confidence across the merged events.
+After classification, events are sorted by time and adjacent **crowd-excitement** events with a gap smaller than `merge_gap_sec` (default 2.0s) are merged. The merged event spans from the earliest start to the latest end, and takes the maximum confidence across the merged events. Shot events are never merged — two arcs 1.5 s apart are two shots.
 
 ---
 
@@ -309,12 +323,24 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `yolo_model` | `str` | `"yolo11m.pt"` | YOLO model file (auto-downloads) |
-| `yolo_confidence` | `float` | `0.5` | Minimum detection confidence |
+| `yolo_confidence` | `float` | `0.5` | Minimum confidence for ball/player boxes |
+| `imgsz` | `int` | `1280` | YOLO inference size on the long edge (`--imgsz`) |
+| `hoop_confidence` | `float` | `0.3` | Minimum confidence for hoop/rim boxes, all backends (`--hoop-confidence`) |
 | `frame_skip` | `int` | `2` | Analyze every Nth frame |
 | `max_resolution` | `int` | `1920` | Downscale frames larger than this |
 | `input_lut` | `Path \| None` | `None` | Path to `.cube` 3D LUT file (or `.zip`/`.lut` archive) for log footage |
-| `roboflow_model_id` | `str \| None` | `None` | Roboflow model ID for supplemental detection (e.g. `"basketball-detection/1"`) |
-| `roboflow_confidence` | `float` | `0.5` | Confidence threshold for Roboflow model |
+| `roboflow_model_id` | `str \| None` | `None` | Roboflow model ID — primary with `detector_backend="roboflow"`, supplemental otherwise |
+| `roboflow_confidence` | `float` | `0.4` | Confidence threshold for Roboflow ball/player boxes |
+| `detector_backend` | `str` | `"yolo"` | `"yolo"`, `"rfdetr"` or `"roboflow"` |
+| `rfdetr_model_size` | `str` | `"small"` | RF-DETR size (`nano` … `2xlarge`) |
+| `rfdetr_weights` | `str \| None` | `None` | Fine-tuned RF-DETR checkpoint (`.pth`) |
+| `rfdetr_num_classes` | `int \| None` | `None` | Head size of the checkpoint (derived from `--rfdetr-classes`) |
+| `rfdetr_class_names` | `list[str] \| None` | `None` | Class names in dataset-index order |
+| `rfdetr_resolution` | `int \| None` | `None` | RF-DETR input resolution (multiple of 56) |
+| `nms_enabled` | `bool` | `False` | Per-role NMS via `supervision` (`--nms`) |
+| `nms_threshold` | `float` | `0.5` | IoU threshold for NMS |
+| `review_codec` | `str` | `"hevc"` | `--review-export` codec: `hevc`, `h264`, or `mp4v` (OpenCV fallback) |
+| `review_quality` | `int \| None` | `None` | CRF (software encoders) or kbit/s (hardware encoders) |
 
 ### AudioConfig
 
@@ -339,17 +365,25 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `kalman_measurement_noise` | `float` | `0.1` | Kalman filter measurement noise scale |
 | `max_ball_gap_frames` | `int` | `10` | Max frames to interpolate missing ball |
 | `shot_min_arc_height_px` | `int` | `50` | Minimum arc height (pixels) for a shot |
-| `hoop_proximity_px` | `int` | `80` | Distance (pixels) to count as through hoop |
+| `shot_arc_end_descent_px` | `int` | `50` | Descent below the peak (by a detected position) that ends an arc |
+| `hoop_proximity_px` | `int` | `80` | Distance (pixels) to count as through hoop (legacy centre-only fallback) |
 | `hoop_x_tolerance_ratio` | `float` | `0.3` | Horizontal tolerance as fraction of hoop bbox width |
 | `hoop_entry_y_margin_px` | `int` | `30` | Vertical margin above/below hoop top for entry detection |
+| `hoop_obs_max_age_frames` | `int` | `30` | Hoop observations further than this from a shot's descent are ignored (→ `made=None`) |
 | `max_ball_jump_px` | `int` | `200` | Max pixel distance from predicted position to accept a detection |
 | `ball_gate_weight` | `float` | `0.5` | Blend factor for gated detection: 0=pure confidence, 1=pure proximity |
 | `reacquire_after_gap_frames` | `int` | `5` | After this many missed frames, disable distance gate for re-acquisition |
-| `shot_hoop_x_range_ratio` | `float` | `0.5` | Max horizontal distance from hoop (as fraction of frame width) for arc validation |
+| `shot_hoop_x_range_ratio` | `float` | `0.35` | Max horizontal distance from hoop (as fraction of frame width) for arc validation |
+| `shot_require_peak_above_rim` | `bool` | `True` | Reject arcs that never rise above the rim they are judged against |
+| `shot_peak_rim_margin_px` | `int` | `20` | Slack below the rim top still accepted by the peak gate |
 | `shot_min_descent_ratio` | `float` | `0.15` | Ball must descend at least this fraction of ascent height (low for layups) |
-| `shot_max_arc_frames` | `int` | `90` | Max tracked positions in a single arc (~3s at 30fps/skip-2) |
-| `shot_pre_peak_frames` | `int` | `15` | Max frames before peak to include in shot event window |
-| `shot_post_arc_frames` | `int` | `10` | Extra frames past arc_end to check for made shot (backboard bounces) |
+| `shot_max_arc_sec` | `float` | `3.0` | Max duration of a single arc in source seconds |
+| `shot_pre_peak_sec` | `float` | `0.5` | Max time before peak to include in shot event window |
+| `shot_post_arc_sec` | `float` | `0.35` | Extra time past arc_end to check for made shot (backboard bounces) |
+| `consensus_required` | `int` | `3` | Detections within the window needed to start a ball track (1 = off; `--consensus`) |
+| `consensus_window` | `int` | `5` | Frame window for consensus |
+| `consensus_max_spread_px` | `int` | `100` | Max spatial spread among consensus candidates |
+| `use_polygon_zone` | `bool` | `False` | Net-zone made-shot fallback (`--polygon-zone`, needs `supervision`) |
 | `deepsort_max_age` | `int` | `30` | Frames before dropping unmatched track |
 | `deepsort_n_init` | `int` | `3` | Detections needed to confirm a track |
 | `enable_player_tracking` | `bool` | `True` | Set `False` to skip DeepSORT player tracking (`--no-players`) |
@@ -358,9 +392,9 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `min_confidence` | `float` | `0.7` | Minimum confidence to report an event |
-| `video_weight` | `float` | `0.6` | Video signal weight in fusion |
-| `audio_weight` | `float` | `0.4` | Audio signal weight in fusion |
+| `min_confidence` | `float` | `0.7` | Minimum fused confidence to report an event |
+| `min_video_confidence` | `float` | `0.5` | Hard floor on a shot's video-only confidence (`--min-video-confidence`) |
+| `audio_weight` | `float` | `0.4` | Share of the remaining headroom audio may add; never gates |
 | `highlight_pre_pad_sec` | `float` | `3.0` | Seconds before event for highlight clip |
 | `highlight_post_pad_sec` | `float` | `2.0` | Seconds after event for highlight clip |
 | `merge_gap_sec` | `float` | `2.0` | Merge events closer than this (seconds) |

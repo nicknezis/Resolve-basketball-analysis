@@ -12,12 +12,21 @@ from src.config import EventConfig
 
 logger = logging.getLogger(__name__)
 
+# Base video confidence by how much hoop evidence backed the shot verdict.
+VIDEO_CONF_MADE = 0.85          # ball seen going through the rim
+VIDEO_CONF_MISS = 0.70          # rim in view, ball did not go through
+VIDEO_CONF_NO_HOOP = 0.55       # arc only, no rim to judge against
+
+# Event types that may be merged when adjacent.  Shots are never merged:
+# two arcs 1.5 s apart are two shots.
+MERGEABLE_TYPES = {"crowd_excitement"}
+
 
 @dataclass
 class GameEvent:
     """A classified basketball game event."""
 
-    event_type: str  # "made_shot", "three_pointer", "dunk", "fast_break", etc.
+    event_type: str  # "made_shot", "shot_attempt", "crowd_excitement", ...
     start_frame: int
     end_frame: int
     start_sec: float
@@ -32,9 +41,9 @@ class EventClassifier:
     """Combines video analysis (shots, tracking) with audio analysis (crowd, whistles)
     to classify basketball game events and assign confidence scores.
 
-    The fusion model weights video and audio signals independently,
-    then combines them. Corroborating signals from both modalities
-    boost overall confidence.
+    Video is the primary signal.  Audio can only *raise* a shot's confidence
+    (``fused = video + audio_weight * audio * (1 - video)``); it is never
+    required, so a clean made shot in a quiet gym is still reported.
     """
 
     def __init__(self, config: EventConfig | None = None, fps: float = 29.97):
@@ -52,7 +61,7 @@ class EventClassifier:
         Args:
             shot_events: Detected shot attempts/makes from BallTracker.
             audio_events: Crowd excitement and whistle events from AudioAnalyzer.
-            scenes: Scene boundaries from SceneDetector.
+            scenes: Scene boundaries from SceneDetector (currently unused).
 
         Returns:
             List of classified GameEvent objects, filtered by min confidence.
@@ -62,7 +71,11 @@ class EventClassifier:
         # Classify shot events (video-primary)
         for shot in shot_events:
             event = self._classify_shot(shot, audio_events)
-            if event and event.confidence >= self.config.min_confidence:
+            if event is None:
+                continue
+            if event.video_confidence < self.config.min_video_confidence:
+                continue
+            if event.confidence >= self.config.min_confidence:
                 events.append(event)
 
         # Find crowd excitement peaks not already covered by shot events
@@ -83,42 +96,47 @@ class EventClassifier:
         start_sec = shot.start_frame / self.fps
         end_sec = shot.end_frame / self.fps
 
-        # Base video confidence from shot detection
-        video_conf = 0.7 if shot.made else 0.5
+        # Base video confidence from how the verdict was reached
+        if shot.made:
+            video_conf = VIDEO_CONF_MADE
+        elif shot.made is False:
+            video_conf = VIDEO_CONF_MISS
+        else:
+            video_conf = VIDEO_CONF_NO_HOOP
 
         # Higher confidence for larger/cleaner arcs
         if shot.arc_height_px > 150:
-            video_conf = min(1.0, video_conf + 0.1)
+            video_conf += 0.05
 
         # Boost for arcs whose descent lands near the hoop
         if shot.hoop_x_distance is not None and shot.hoop_x_distance < 50:
-            video_conf = min(1.0, video_conf + 0.1)
+            video_conf += 0.05
 
         # Boost for clean descent (ball fell well past peak)
         if shot.descent_ratio is not None and shot.descent_ratio > 0.7:
-            video_conf = min(1.0, video_conf + 0.05)
+            video_conf += 0.05
+
+        video_conf = min(1.0, video_conf)
 
         # Check for corroborating audio
         audio_conf = self._find_audio_correlation(start_sec, end_sec, audio_events)
 
-        # Determine event type
-        if shot.made:
-            event_type = "made_shot"
-        else:
-            event_type = "shot_attempt"
+        event_type = "made_shot" if shot.made else "shot_attempt"
 
-        # Fuse confidences
-        fused = (
-            self.config.video_weight * video_conf
-            + self.config.audio_weight * audio_conf
-        )
+        # Audio boosts but never gates
+        fused = video_conf + self.config.audio_weight * audio_conf * (1.0 - video_conf)
 
         details = {
             "arc_height_px": shot.arc_height_px,
             "ball_positions_count": len(shot.ball_positions),
+            "made": shot.made,
         }
+        if shot.made_via:
+            details["made_via"] = shot.made_via
         if shot.hoop_x is not None:
             details["hoop_position"] = [shot.hoop_x, shot.hoop_y]
+        if shot.hoop_x_distance is not None:
+            details["hoop_x_distance"] = round(shot.hoop_x_distance, 1)
 
         return GameEvent(
             event_type=event_type,
@@ -207,7 +225,11 @@ class EventClassifier:
         return standalone
 
     def _merge_nearby(self, events: list[GameEvent]) -> list[GameEvent]:
-        """Merge events that are very close together in time."""
+        """Merge adjacent events of the same *mergeable* type.
+
+        Only audio-only crowd events are merged; shot events are always
+        kept separate.
+        """
         if not events:
             return events
 
@@ -215,7 +237,11 @@ class EventClassifier:
         for ev in events[1:]:
             prev = merged[-1]
             gap = ev.start_sec - prev.end_sec
-            if gap <= self.config.merge_gap_sec and ev.event_type == prev.event_type:
+            if (
+                gap <= self.config.merge_gap_sec
+                and ev.event_type == prev.event_type
+                and ev.event_type in MERGEABLE_TYPES
+            ):
                 # Merge: extend previous event, keep higher confidence
                 merged[-1] = GameEvent(
                     event_type=prev.event_type,
@@ -226,7 +252,7 @@ class EventClassifier:
                     confidence=max(prev.confidence, ev.confidence),
                     video_confidence=max(prev.video_confidence, ev.video_confidence),
                     audio_confidence=max(prev.audio_confidence, ev.audio_confidence),
-                    details={**prev.details, **ev.details},
+                    details={**ev.details, **prev.details},
                 )
             else:
                 merged.append(ev)

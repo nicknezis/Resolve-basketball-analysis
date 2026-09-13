@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-import subprocess
 from collections import deque
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -15,8 +15,15 @@ from src.analysis.color import FrameLUT
 from src.analysis.event_classifier import GameEvent
 from src.analysis.object_detector import FrameDetections
 from src.analysis.player_tracker import FrameTracking
+from src.analysis.video_io import FfmpegVideoWriter, find_ffmpeg, run_ffmpeg
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=2)
+def _cached_lut(path: str | None) -> FrameLUT:
+    """Build a FrameLUT once per LUT file — the 256³ table costs ~48 MB and seconds."""
+    return FrameLUT(Path(path) if path else None)
 
 # BGR color constants
 COLOR_BALL = (0, 140, 255)       # orange
@@ -199,7 +206,7 @@ class ClipReview:
         input_lut: Path | None,
     ) -> tuple:
         """Build shared lookups used by both replay() and export()."""
-        lut = FrameLUT(input_lut)
+        lut = _cached_lut(str(input_lut) if input_lut else None)
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             logger.error("Cannot open video: %s", video_path)
@@ -256,6 +263,7 @@ class ClipReview:
         # Draw shot arc trajectories
         for shot in shot_events:
             if shot.start_frame <= frame_idx <= shot.end_frame + 30:
+                # made is tri-state; None (no hoop seen) draws as an attempt
                 color = COLOR_SHOT_MADE if shot.made else COLOR_SHOT_ATTEMPT
                 pts = [
                     (int(bp.x * coord_scale), int(bp.y * coord_scale))
@@ -309,8 +317,15 @@ class ClipReview:
         fps: float,
         input_lut: Path | None = None,
         max_resolution: int = 0,
+        codec: str = "hevc",
+        quality: int | None = None,
     ) -> None:
-        """Export the review replay as a video file (no display window)."""
+        """Export the review replay as a video file (no display window).
+
+        Frames are piped to ffmpeg (``codec`` = ``hevc`` or ``h264``) with the
+        source audio muxed in the same pass.  ``codec="mp4v"`` — or a missing
+        ffmpeg — falls back to OpenCV's MPEG-4 Part 2 writer.
+        """
         result = self._prepare(
             video_path, start_frame, all_detections, player_tracks,
             ball_positions, input_lut,
@@ -319,71 +334,90 @@ class ClipReview:
             return
         lut, cap, det_lookup, ball_lookup = result
 
-        writer = None
         total = end_frame - start_frame
+        logger.info("Exporting review video to %s (%d frames, %s)", export_path, total, codec)
+
+        use_ffmpeg = codec != "mp4v" and find_ffmpeg() is not None
+        if codec != "mp4v" and not use_ffmpeg:
+            logger.warning("ffmpeg not found; falling back to OpenCV mp4v for %s", export_path)
+
+        writer = None
         frame_idx = start_frame
-        logger.info("Exporting review video to %s (%d frames)", export_path, total)
+        tmp_path = export_path.with_suffix(".tmp.mp4")  # cv2 fallback only
+        try:
+            while frame_idx < end_frame:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame = lut.apply(frame)
 
-        # Write video to a temp file so we can mux audio afterward.
-        tmp_path = export_path.with_suffix(".tmp.mp4")
+                canvas, scale = self._render_overlays(
+                    frame, frame_idx, start_frame, end_frame,
+                    det_lookup, shot_events, game_events,
+                    ball_positions, ball_lookup,
+                    max_resolution=max_resolution,
+                )
 
-        while frame_idx < end_frame:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = lut.apply(frame)
+                # HUD (no pause/controls in export)
+                pct = (frame_idx - start_frame) / total * 100 if total > 0 else 0
+                hud = f"Frame {frame_idx} ({pct:.1f}%)"
+                _put_label(canvas, hud, 8, canvas.shape[0] - 12, (200, 200, 200))
 
-            canvas, scale = self._render_overlays(
-                frame, frame_idx, start_frame, end_frame,
-                det_lookup, shot_events, game_events,
-                ball_positions, ball_lookup,
-                max_resolution=max_resolution,
-            )
+                if writer is None:
+                    h, w = canvas.shape[:2]
+                    if use_ffmpeg:
+                        writer = FfmpegVideoWriter(
+                            export_path, fps, (w, h), codec=codec, quality=quality,
+                            audio_source=video_path,
+                            audio_start_sec=start_frame / fps,
+                            audio_duration_sec=total / fps,
+                        )
+                    else:
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(str(tmp_path), fourcc, fps, (w, h))
+                writer.write(canvas)
 
-            # HUD (no pause/controls in export)
-            pct = (frame_idx - start_frame) / total * 100 if total > 0 else 0
-            hud = f"Frame {frame_idx} ({pct:.1f}%)"
-            _put_label(canvas, hud, 8, canvas.shape[0] - 12, (200, 200, 200))
-
-            if writer is None:
-                h, w = canvas.shape[:2]
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(str(tmp_path), fourcc, fps, (w, h))
-            writer.write(canvas)
-
-            frame_idx += 1
-
-        if writer is not None:
-            writer.release()
-        cap.release()
+                frame_idx += 1
+        finally:
+            cap.release()
 
         if writer is None:
             return
 
-        # Mux audio from the source video into the exported clip.
-        audio_start = start_frame / fps
-        audio_duration = (end_frame - start_frame) / fps
-        mux_cmd = [
-            "ffmpeg", "-y",
+        if use_ffmpeg:
+            writer.close()
+            logger.info("Review video saved: %s (%s)", export_path, writer.encoder)
+            return
+
+        writer.release()
+        self._mux_audio_cv2(tmp_path, export_path, video_path, start_frame, end_frame, fps)
+        logger.info("Review video saved: %s (mp4v)", export_path)
+
+    @staticmethod
+    def _mux_audio_cv2(
+        tmp_path: Path, export_path: Path, video_path: str,
+        start_frame: int, end_frame: int, fps: float,
+    ) -> None:
+        """Remux the OpenCV-written video with AAC audio from the source."""
+        args = [
+            "-y",
             "-i", str(tmp_path),
-            "-ss", str(audio_start),
-            "-t", str(audio_duration),
+            "-ss", f"{start_frame / fps:.6f}",
+            "-t", f"{(end_frame - start_frame) / fps:.6f}",
             "-i", video_path,
             "-c:v", "copy",
-            "-c:a", "copy",
+            "-c:a", "aac", "-b:a", "192k",
             "-map", "0:v:0",
             "-map", "1:a:0?",
             "-shortest",
             str(export_path),
         ]
         try:
-            subprocess.run(mux_cmd, capture_output=True, check=True)
+            run_ffmpeg(args, description="review audio mux")
             tmp_path.unlink(missing_ok=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        except (RuntimeError, FileNotFoundError) as exc:
             logger.warning("Could not mux audio, keeping video-only export: %s", exc)
             tmp_path.rename(export_path)
-
-        logger.info("Review video saved: %s", export_path)
 
     def replay(
         self,

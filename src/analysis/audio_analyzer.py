@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +10,7 @@ from pathlib import Path
 import librosa
 import numpy as np
 
+from src.analysis.video_io import run_ffmpeg
 from src.config import AudioConfig
 
 logger = logging.getLogger(__name__)
@@ -40,8 +40,8 @@ def extract_audio(video_path: Path, output_path: Path | None = None, sample_rate
     if output_path is None:
         output_path = Path(tempfile.mktemp(suffix=".wav"))
 
-    cmd = [
-        "ffmpeg", "-y",
+    args = [
+        "-y",
         "-i", str(video_path),
         "-vn",  # no video
         "-acodec", "pcm_s16le",
@@ -49,8 +49,8 @@ def extract_audio(video_path: Path, output_path: Path | None = None, sample_rate
         "-ac", "1",  # mono
         str(output_path),
     ]
-    logger.info("Extracting audio: %s", " ".join(cmd))
-    subprocess.run(cmd, capture_output=True, check=True)
+    logger.info("Extracting audio from %s", Path(video_path).name)
+    run_ffmpeg(args, description="audio extraction")
     return output_path
 
 
