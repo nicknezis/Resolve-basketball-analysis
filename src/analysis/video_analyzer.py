@@ -88,7 +88,11 @@ def analyze_video(
     )
     if config.review_export:
         config.review_export.mkdir(parents=True, exist_ok=True)
-        ClipReview().export(export_path=config.review_export / "review.mp4", **review_kwargs)
+        ClipReview().export(
+            export_path=config.review_export / "review.mp4",
+            codec=config.video.review_codec, quality=config.video.review_quality,
+            **review_kwargs,
+        )
     if config.review:
         ClipReview().replay(**review_kwargs)
 
@@ -268,7 +272,7 @@ def _analyze_clip(
     # --- Video analysis on the source range ---
     lut = FrameLUT(config.video.input_lut)
     detector = ObjectDetector(config.video, device=config.device, detect_players=config.tracking.enable_player_tracking)
-    ball_tracker = BallTracker(config.tracking)
+    ball_tracker = BallTracker(config.tracking, fps=media_fps)
     player_tracker = PlayerTracker(config.tracking, device=config.device) if config.tracking.enable_player_tracking else None
 
     cap = cv2.VideoCapture(str(analysis_path))
@@ -297,12 +301,9 @@ def _analyze_clip(
         relative_frame = frame_idx - source_start
         if relative_frame % config.video.frame_skip == 0:
             frame = lut.apply(frame)
-            h, w = frame.shape[:2]
-            if max(h, w) > config.video.max_resolution:
-                scale = config.video.max_resolution / max(h, w)
-                frame_resized = cv2.resize(frame, (int(w * scale), int(h * scale)))
-            else:
-                frame_resized = frame
+            frame_resized = _downscale(frame, config.video.max_resolution)
+            if relative_frame == 0:
+                ball_tracker.set_frame_size(frame_resized.shape[1], frame_resized.shape[0])
 
             fd = detector.detect_frame(frame_resized, frame_idx)
             all_detections.append(fd)
@@ -320,8 +321,9 @@ def _analyze_clip(
                     confidence=best_hoop.confidence,
                 ))
 
-            # Player tracking needs the original frame for color sampling
-            tracking = player_tracker.update(frame, fd) if player_tracker else None
+            # Player tracking samples jersey colour from the frame, so it must
+            # see the same (downscaled) frame the bboxes were computed on.
+            tracking = player_tracker.update(frame_resized, fd) if player_tracker else None
 
             # Live preview rendering (use clip-relative indices for display)
             if preview_active and frame_preview is not None:
@@ -344,6 +346,7 @@ def _analyze_clip(
         player_tracker.classify_teams()
 
     # Shot detection using incrementally collected data
+    _log_hoop_coverage(hoop_observations, len(all_detections), detector.hoop_capable)
     ball_tracker.set_hoop_observations(hoop_observations)
     shot_events = ball_tracker.find_shots()
 
@@ -414,7 +417,11 @@ def _analyze_clip(
     )
     if config.review_export:
         config.review_export.mkdir(parents=True, exist_ok=True)
-        ClipReview().export(export_path=config.review_export / f"clip_{clip_index}.mp4", **review_kwargs)
+        ClipReview().export(
+            export_path=config.review_export / f"clip_{clip_index}.mp4",
+            codec=config.video.review_codec, quality=config.video.review_quality,
+            **review_kwargs,
+        )
     if config.review:
         ClipReview().replay(**review_kwargs)
 
@@ -447,6 +454,33 @@ def _analyze_clip(
     )
 
     return game_events, mapped_scenes
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _downscale(frame, max_resolution: int):
+    """Shrink a frame so its long edge is at most ``max_resolution`` px."""
+    h, w = frame.shape[:2]
+    if max(h, w) > max_resolution:
+        scale = max_resolution / max(h, w)
+        return cv2.resize(frame, (int(w * scale), int(h * scale)))
+    return frame
+
+
+def _log_hoop_coverage(
+    hoop_observations: list[HoopObservation], analysed_frames: int, hoop_capable: bool,
+) -> None:
+    """Report how often the rim was seen — made/miss depends on it."""
+    n = len(hoop_observations)
+    pct = 100.0 * n / analysed_frames if analysed_frames else 0.0
+    logger.info("  Hoop observations: %d of %d analysed frames (%.0f%%)", n, analysed_frames, pct)
+    if n == 0 and hoop_capable:
+        logger.warning(
+            "  No hoop detected in this clip although the detector supports it — "
+            "shots will be reported with made=None. Try lowering --hoop-confidence."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +649,7 @@ def _run_pipeline(
 
     logger.info("=== Phase 3: Object Detection + Tracking ===")
     detector = ObjectDetector(config.video, device=config.device, detect_players=config.tracking.enable_player_tracking)
-    ball_tracker = BallTracker(config.tracking)
+    ball_tracker = BallTracker(config.tracking, fps=fps)
     player_tracker = PlayerTracker(config.tracking, device=config.device) if config.tracking.enable_player_tracking else None
 
     lut = FrameLUT(config.video.input_lut)
@@ -638,12 +672,9 @@ def _run_pipeline(
 
         if frame_idx % config.video.frame_skip == 0:
             frame = lut.apply(frame)
-            h, w = frame.shape[:2]
-            if max(h, w) > config.video.max_resolution:
-                scale = config.video.max_resolution / max(h, w)
-                frame_resized = cv2.resize(frame, (int(w * scale), int(h * scale)))
-            else:
-                frame_resized = frame
+            frame_resized = _downscale(frame, config.video.max_resolution)
+            if frame_idx == 0:
+                ball_tracker.set_frame_size(frame_resized.shape[1], frame_resized.shape[0])
 
             fd = detector.detect_frame(frame_resized, frame_idx)
             all_detections.append(fd)
@@ -661,8 +692,8 @@ def _run_pipeline(
                     confidence=best_hoop.confidence,
                 ))
 
-            # Player tracking
-            tracking = player_tracker.update(frame, fd) if player_tracker else None
+            # Player tracking (same coordinate space as the bboxes)
+            tracking = player_tracker.update(frame_resized, fd) if player_tracker else None
 
             # Live preview
             if preview_active and frame_preview is not None:
@@ -685,6 +716,7 @@ def _run_pipeline(
         player_tracker.classify_teams()
 
     logger.info("=== Phase 4: Shot Detection ===")
+    _log_hoop_coverage(hoop_observations, len(all_detections), detector.hoop_capable)
     ball_tracker.set_hoop_observations(hoop_observations)
     shot_events = ball_tracker.find_shots()
 

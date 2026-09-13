@@ -1,5 +1,5 @@
 ultralytics>=8.0
-opencv-python>=4.8
+opencv-python>=4.8,<4.13
 scenedetect[opencv]>=0.6
 librosa>=0.10
 soundfile>=0.12
@@ -7,10 +7,17 @@ numpy>=1.24
 deep-sort-realtime>=1.3
 filterpy>=1.4
 tqdm>=4.65
+supervision>=0.20
+
+# deep-sort-realtime imports pkg_resources, which setuptools>=81 removed
+setuptools<81
+
+# Roboflow models (--detector roboflow / --roboflow-model). Runs locally via ONNX.
+# Declares setuptools>=83 but works with the pin above; `pip check` will grumble.
+inference>=1.0
 
 # Optional: RF-DETR detection backend
 # rfdetr>=1.0
-# supervision>=0.20
 
 # Optional: pose estimation
 # mediapipe>=0.10

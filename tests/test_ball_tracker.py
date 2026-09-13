@@ -90,7 +90,8 @@ class TestBboxShotDetection:
 
     def test_miss_horizontal(self):
         """Ball descends but is too far left of the hoop -> miss."""
-        config = TrackingConfig(shot_min_arc_height_px=150)
+        # Wide hoop-direction gate so the arc is *detected* and judged a miss
+        config = TrackingConfig(shot_min_arc_height_px=150, shot_hoop_x_range_ratio=0.5)
         tracker = BallTracker(config)
 
         # Hoop at x=[400,500]
@@ -198,8 +199,8 @@ class TestSetHoopPositionsBackwardCompat:
         # Center-proximity check should fire — ball passes near median hoop
         assert shots[0].made is True
 
-    def test_no_hoops_no_made(self):
-        """Without any hoop data, all shots should be attempts (not made)."""
+    def test_no_hoops_made_is_unknown(self):
+        """Without any hoop data the verdict is unknown (None), not a miss."""
         config = TrackingConfig(shot_min_arc_height_px=150)
         tracker = BallTracker(config)
 
@@ -211,7 +212,8 @@ class TestSetHoopPositionsBackwardCompat:
 
         shots = tracker.find_shots()
         assert len(shots) >= 1
-        assert shots[0].made is False
+        assert shots[0].made is None
+        assert shots[0].made_via is None
 
 
 class TestEndToEnd:
@@ -251,7 +253,9 @@ class TestEndToEnd:
 
     def test_observations_preferred_over_center_proximity(self):
         """When both observations and median hoop exist, bbox check takes priority."""
-        config = TrackingConfig(shot_min_arc_height_px=150, hoop_proximity_px=1000)
+        config = TrackingConfig(
+            shot_min_arc_height_px=150, hoop_proximity_px=1000, shot_hoop_x_range_ratio=0.5,
+        )
         tracker = BallTracker(config)
 
         # Arc near hoop horizontally (passes hoop-directed gate) but doesn't
@@ -399,7 +403,7 @@ class TestBackboardShot:
 
     def test_backboard_shot_missed_without_extension(self):
         """Without post-arc extension, backboard shot is detected but not made."""
-        config = TrackingConfig(shot_min_arc_height_px=50, shot_post_arc_frames=0)
+        config = TrackingConfig(shot_min_arc_height_px=50, shot_post_arc_sec=0.0)
         tracker = BallTracker(config)
 
         positions = self._make_backboard_positions()
@@ -510,9 +514,13 @@ class TestMultiFrameConsensus:
 
         assert result is None
 
-    def test_consensus_disabled_with_default_config(self):
-        """With consensus_required=1 (default), first detection is accepted."""
-        config = TrackingConfig()
+    def test_default_consensus_is_three(self):
+        """Consensus is on by default — a single spurious detection can't seed a track."""
+        assert TrackingConfig().consensus_required == 3
+
+    def test_consensus_disabled_with_required_one(self):
+        """With consensus_required=1, the first detection is accepted."""
+        config = TrackingConfig(consensus_required=1)
         tracker = BallTracker(config)
 
         fd = FrameDetections(frame_idx=0)
@@ -552,3 +560,200 @@ class TestMultiFrameConsensus:
         ))
         result = tracker.update(fd)
         assert result is None
+
+
+class TestSparseTrajectories:
+    """Arc finding must reason in source frames, not list indices.
+
+    ``_positions`` has holes wherever the ball was lost, so two unrelated
+    arcs can sit next to each other in the list while being many seconds
+    apart in the video.
+    """
+
+    def test_two_arcs_ten_seconds_apart_are_two_short_shots(self):
+        config = TrackingConfig(shot_min_arc_height_px=150, max_ball_gap_frames=10)
+        tracker = BallTracker(config, fps=60.0)
+
+        arc1 = _make_arc_positions(
+            start_frame=0, start_x=450, start_y=350, peak_y=100, end_y=350, num_points=12,
+        )
+        # 600 frames (10 s) later: a second, unrelated arc
+        arc2 = _make_arc_positions(
+            start_frame=600, start_x=450, start_y=350, peak_y=100, end_y=350, num_points=12,
+        )
+        tracker._positions = arc1 + arc2
+
+        shots = tracker.find_shots()
+        assert len(shots) == 2
+        for shot in shots:
+            assert shot.end_frame - shot.start_frame <= 12
+
+    def test_gap_inside_arc_breaks_it(self):
+        """Ascent, then the ball is lost for 5 s, then a descent: not one arc."""
+        config = TrackingConfig(shot_min_arc_height_px=100, max_ball_gap_frames=10)
+        tracker = BallTracker(config, fps=60.0)
+
+        ascent = [BallPosition(frame_idx=i, x=450, y=400 - i * 25, predicted=False) for i in range(12)]
+        descent = [BallPosition(frame_idx=300 + i, x=450, y=100 + i * 25, predicted=False) for i in range(12)]
+        tracker._positions = ascent + descent
+
+        assert tracker.find_shots() == []
+
+    def test_max_arc_duration_uses_frames_not_indices(self):
+        """Sparse positions spanning 6 s exceed shot_max_arc_sec even with few samples."""
+        config = TrackingConfig(shot_min_arc_height_px=100, max_ball_gap_frames=60, shot_max_arc_sec=3.0)
+        tracker = BallTracker(config, fps=60.0)
+
+        # 10 samples, 40 frames apart = 360 frames = 6 s at 60 fps
+        ys = [400, 330, 260, 190, 120, 100, 160, 220, 280, 340]
+        tracker._positions = [
+            BallPosition(frame_idx=i * 40, x=450, y=y, predicted=False) for i, y in enumerate(ys)
+        ]
+
+        assert tracker.find_shots() == []
+
+    def test_predicted_positions_cannot_terminate_arc(self):
+        """Kalman extrapolation alone must not manufacture a descent."""
+        config = TrackingConfig(shot_min_arc_height_px=100)
+        tracker = BallTracker(config)
+
+        ascent = [BallPosition(frame_idx=i, x=450, y=400 - i * 30, predicted=False) for i in range(11)]
+        fake_descent = [
+            BallPosition(frame_idx=11 + i, x=450, y=100 + i * 30, predicted=True) for i in range(6)
+        ]
+        tracker._positions = ascent + fake_descent
+
+        assert tracker.find_shots() == []
+
+
+class TestHoopSelection:
+    """Which rim judges a shot, and when no rim should."""
+
+    def test_stale_hoop_observation_gives_unknown(self):
+        """A rim seen 20 s earlier says nothing about a panned camera now."""
+        config = TrackingConfig(shot_min_arc_height_px=150, hoop_obs_max_age_frames=30)
+        tracker = BallTracker(config, fps=60.0)
+
+        positions = _make_arc_positions(
+            start_frame=1200, start_x=450, start_y=350, peak_y=100, end_y=350, num_points=12,
+        )
+        tracker._positions = positions
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=0)])
+
+        shots = tracker.find_shots()
+        assert len(shots) == 1
+        assert shots[0].made is None
+
+    def test_nearest_rim_horizontally_is_used(self):
+        """With both baskets in frame, the descent is judged against the near one."""
+        config = TrackingConfig(shot_min_arc_height_px=150)
+        tracker = BallTracker(config)
+
+        # Ball descends through x=450 — the left rim.  Right rim at x=[1000,1100].
+        positions = _make_arc_positions(
+            start_frame=50, start_x=450, start_y=350, peak_y=100, end_y=350, num_points=12,
+        )
+        tracker._positions = positions
+        left = _make_hoop_observation(frame_idx=55, x1=400, x2=500)
+        right = _make_hoop_observation(frame_idx=56, x1=1000, x2=1100)  # closer in time
+        tracker.set_hoop_observations([right, left])
+
+        shots = tracker.find_shots()
+        assert len(shots) == 1
+        assert shots[0].made is True
+        assert shots[0].hoop_bbox == left.bbox
+
+    def test_gate_c_uses_real_frame_width(self):
+        """A descent on the far side of a 640-px frame from the rim is rejected."""
+        config = TrackingConfig(shot_min_arc_height_px=150, shot_hoop_x_range_ratio=0.25)
+        tracker = BallTracker(config, frame_size=(640, 360))
+
+        # Rim at x≈450, ball arc at x=100: 350 px apart > 0.25 * 640 = 160
+        positions = _make_arc_positions(
+            start_frame=50, start_x=100, start_y=350, peak_y=100, end_y=350, num_points=12,
+        )
+        tracker._positions = positions
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=55)])
+
+        assert tracker.find_shots() == []
+
+    def test_ball_in_basket_detection_marks_made(self):
+        """A detector-reported ball-in-basket during the descent is a make."""
+        config = TrackingConfig(shot_min_arc_height_px=150)
+        tracker = BallTracker(config)
+
+        # Arc misses the bbox horizontally (x=550 vs rim 400-500 ±30)
+        positions = _make_arc_positions(
+            start_frame=50, start_x=550, start_y=350, peak_y=100, end_y=350, num_points=12,
+        )
+        tracker._positions = positions
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=55)])
+        tracker.set_ball_in_basket_frames([59])
+
+        shots = tracker.find_shots()
+        assert len(shots) == 1
+        assert shots[0].made is True
+        assert shots[0].made_via == "ball_in_basket"
+
+
+class TestKalmanReacquire:
+    def test_covariance_reinflated_on_reseed(self):
+        tracker = BallTracker(TrackingConfig(consensus_required=1))
+        import numpy as np
+
+        # Converge the filter a bit
+        for i in range(20):
+            fd = FrameDetections(frame_idx=i)
+            fd.balls.append(Detection(
+                class_name="ball", confidence=0.9, bbox=(100 + i, 100, 120 + i, 120), frame_idx=i,
+            ))
+            tracker.update(fd)
+        assert tracker._kf.P[0, 0] < 10.0
+
+        tracker._seed_filter(500, 500)
+        assert np.allclose(tracker._kf.P, np.eye(4) * 10.0)
+
+
+class TestPeakAboveRimGate:
+    """Gate D: with a rim in view, an arc that never rises above it is not a shot."""
+
+    def test_arc_below_rim_is_rejected(self):
+        config = TrackingConfig(shot_min_arc_height_px=100)
+        tracker = BallTracker(config)
+        # Rim top at y=200; this "arc" peaks at y=300 (a chest pass / dribble)
+        positions = _make_arc_positions(
+            start_frame=50, start_x=450, start_y=500, peak_y=300, end_y=500, num_points=12,
+        )
+        tracker._positions = positions
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=55)])
+        assert tracker.find_shots() == []
+
+    def test_arc_within_margin_is_kept(self):
+        config = TrackingConfig(shot_min_arc_height_px=100, shot_peak_rim_margin_px=20)
+        tracker = BallTracker(config)
+        positions = _make_arc_positions(
+            start_frame=50, start_x=450, start_y=400, peak_y=215, end_y=400, num_points=12,
+        )
+        tracker._positions = positions
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=55)])
+        assert len(tracker.find_shots()) == 1
+
+    def test_gate_skipped_without_rim(self):
+        config = TrackingConfig(shot_min_arc_height_px=100)
+        tracker = BallTracker(config)
+        positions = _make_arc_positions(
+            start_frame=50, start_x=450, start_y=500, peak_y=300, end_y=500, num_points=12,
+        )
+        tracker._positions = positions
+        shots = tracker.find_shots()
+        assert len(shots) == 1 and shots[0].made is None
+
+    def test_gate_can_be_disabled(self):
+        config = TrackingConfig(shot_min_arc_height_px=100, shot_require_peak_above_rim=False)
+        tracker = BallTracker(config)
+        positions = _make_arc_positions(
+            start_frame=50, start_x=450, start_y=500, peak_y=300, end_y=500, num_points=12,
+        )
+        tracker._positions = positions
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=55)])
+        assert len(tracker.find_shots()) == 1

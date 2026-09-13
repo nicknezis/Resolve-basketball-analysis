@@ -31,6 +31,11 @@ source .venv/bin/activate    # macOS / Linux
 pip install -r requirements.txt
 ```
 
+`requirements.txt` pins `setuptools<81` because `deep-sort-realtime` still
+imports `pkg_resources`. The `inference` package declares `setuptools>=83`, so
+`pip check` reports a conflict — it is harmless. Use Python 3.12: newer
+interpreters don't have torch wheels yet.
+
 You also need **FFmpeg** installed for audio extraction:
 
 ```bash
@@ -84,6 +89,23 @@ Or if you installed with `pip install -e .`:
 ```bash
 python -m src.cli --timeline my_game_timeline.json -o my_game_analysis.json
 ```
+
+That runs stock YOLO, which **cannot see the hoop** — every shot comes back as an
+attempt with `made: null`. For made/miss detection use a basketball model
+(see [Detection Backends](#detection-backends--model-weights)); the
+recommended invocation for gym footage is:
+
+```bash
+python -m src.cli --timeline my_game_timeline.json \
+  --detector roboflow --roboflow-model basketball-detection-dn6fg/4 \
+  --input-lut lut/FX30.cube --nms \
+  --review-export review \
+  -o my_game_analysis.json
+```
+
+(`--input-lut` only if the footage is log; `--review-export` writes annotated
+HEVC clips you can scrub to check the detections — `--review-codec h264` if
+you need wider compatibility.)
 
 The analyzer processes each clip's used portion, running:
 - **YOLO object detection** — finds the basketball, hoop, and players in each frame
@@ -176,12 +198,18 @@ Input:
   --input-lut PATH         3D LUT (.cube or .zip/.lut archive) for log footage
 
 Detection:
-  --detector {yolo,rfdetr} Detection model backend (default: yolo)
+  --detector {yolo,rfdetr,roboflow}
+                           Detection model backend (default: yolo)
   --yolo-model NAME        YOLO model name or path (default: yolo11m.pt)
-  --yolo-confidence FLOAT  Detection confidence threshold (default: 0.5)
-  --roboflow-model ID      Roboflow model for hoop + ball detection
-                           (e.g. basketball-detection/1). Requires ROBOFLOW_API_KEY.
-  --roboflow-confidence F  Roboflow confidence threshold (default: 0.5)
+  --yolo-confidence FLOAT  Confidence threshold for ball/player boxes (default: 0.5)
+  --hoop-confidence FLOAT  Confidence threshold for hoop/rim boxes (default: 0.3)
+  --imgsz N                YOLO inference size on the long edge (default: 1280;
+                           Ultralytics' own 640 default shrinks the ball to ~10 px)
+  --roboflow-model ID      Roboflow model (e.g. basketball-player-detection-3-ycjdo/6).
+                           Primary detector with --detector roboflow, otherwise a
+                           supplemental hoop/ball source. Runs locally via the
+                           `inference` package; requires ROBOFLOW_API_KEY.
+  --roboflow-confidence F  Roboflow ball/player confidence threshold (default: 0.4)
   --frame-skip N           Analyze every Nth frame (default: 2)
   --no-players             Disable player detection and tracking (faster)
 
@@ -193,19 +221,29 @@ RF-DETR backend (only used with --detector rfdetr; see "Detection Backends"):
                            in dataset index order (e.g. ball,hoop,player,...)
   --rfdetr-resolution N    Input resolution, must be divisible by 56
 
-Detection post-processing (both backends):
+Detection post-processing (all backends):
   --nms                    Deduplicate overlapping boxes via supervision NMS
   --nms-threshold FLOAT    IoU threshold for NMS (default: 0.5)
   --consensus N            Require N consistent ball detections before starting
-                           a track (1=disabled, 3 recommended; default: 1)
+                           a track (1=disabled; default: 3)
+  --polygon-zone           Also count a made shot when the descent enters a
+                           trapezoidal net zone below the rim (needs supervision)
 
 Classification:
-  --min-confidence FLOAT   Minimum event confidence to report (default: 0.7)
+  --min-confidence FLOAT   Minimum fused (video+audio) confidence (default: 0.7)
+  --min-video-confidence F Minimum video-only confidence for a shot (default: 0.5)
   --crowd-threshold FLOAT  Crowd excitement threshold (default: 0.6)
 
 Output:
   -o, --output PATH        Output JSON path (default: <input>_analysis.json)
-  --review-export DIR      Save review replay videos to DIR (clip_<N>.mp4)
+  --review-export DIR      Save annotated review videos to DIR (clip_<N>.mp4),
+                           no window is opened
+  --review-codec CODEC     hevc (default) | h264 | mp4v. hevc/h264 are encoded by
+                           ffmpeg (VideoToolbox on macOS when available) with AAC
+                           audio and the hvc1 tag; mp4v is the OpenCV fallback
+  --review-quality N       CRF for libx264/libx265 (default 18/20) or kbit/s for
+                           hardware encoders (default ~12 / ~7 Mbit/s per
+                           megapixel for h264 / hevc)
 
 Display:
   --preview                Show live detection preview during analysis
@@ -240,16 +278,41 @@ Options:
 
 ## Detection Backends & Model Weights
 
-The analyzer supports two detection backends, selected with `--detector`:
+The analyzer supports three detection backends, selected with `--detector`:
 
-| Backend | Flag | Weights | Auto-download? |
-|---------|------|---------|----------------|
-| **YOLO** (default) | `--detector yolo` | `yolo11m.pt` (or `--yolo-model`) | Yes — Ultralytics downloads on first run and caches it |
-| **RF-DETR** | `--detector rfdetr` | base COCO checkpoint per `--rfdetr-size`, or `--rfdetr-weights PATH` | Base COCO weights only |
+| Backend | Flag | Weights | Hoop class? |
+|---------|------|---------|-------------|
+| **YOLO** (default) | `--detector yolo` | `yolo11m.pt` (or `--yolo-model`) — Ultralytics downloads on first run | **No** with stock COCO weights; yes with a basketball fine-tune |
+| **RF-DETR** | `--detector rfdetr` | base COCO checkpoint per `--rfdetr-size`, or `--rfdetr-weights PATH` | Only with a fine-tuned checkpoint + `--rfdetr-classes` |
+| **Roboflow** | `--detector roboflow --roboflow-model ID` | downloaded once by the `inference` package (needs `ROBOFLOW_API_KEY`), then runs locally on ONNX | Yes — pick a model with a `rim`/`hoop` class |
 
-Both backends can be combined with `--nms` (deduplicate overlapping boxes),
+> **Made/miss needs a hoop.** Stock COCO weights have no hoop/rim class, so with
+> plain `yolo11m.pt` every shot is reported as `shot_attempt` with `details.made: null`
+> and the detector logs a warning at start-up. Use `--detector roboflow`, add
+> `--roboflow-model` as a supplement, or load a basketball fine-tune.
+
+All backends can be combined with `--nms` (deduplicate overlapping boxes),
 `--consensus N` (require N consistent ball detections before starting a track),
-and `--roboflow-model` (supplemental hoop/ball detection).
+and `--roboflow-model` (supplemental hoop/ball detection for the YOLO/RF-DETR
+backends). Class names from every model are normalised to roles (`ball`,
+`ball-in-basket`, `hoop`/`rim`, `player`, `referee`) in
+`src/analysis/object_detector.py::CLASS_ROLE_MAP`; referees are kept out of
+team classification, and a `ball-in-basket` box during a shot's descent counts
+as a make.
+
+### Choosing a Roboflow model
+
+`scripts/bench_hoop_models.py` samples frames from your own timeline and scores
+candidate Universe models on hoop / ball detection rate and speed:
+
+```bash
+python scripts/bench_hoop_models.py --timeline timeline.json --clip 0-4 \
+  --input-lut lut/FX30.cube --out docs/model-bakeoff.md
+```
+
+Results for the reference footage are in [`docs/model-bakeoff.md`](docs/model-bakeoff.md).
+Public Universe models are trained mostly on broadcast footage; the durable fix
+is fine-tuning on frames from your own gym (see `docs/roboflow-pipeline-improvements.md`).
 
 ### RF-DETR weights
 

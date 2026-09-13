@@ -32,3 +32,12 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local analysis artefacts (timeline exports, results, review renders, logs)
+*_timeline.json
+*_analysis*.json
+clips/
+review/
+review_*/
+*.log
+ground_truth/
