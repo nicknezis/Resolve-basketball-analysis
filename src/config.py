@@ -51,18 +51,25 @@ class AudioConfig:
 class TrackingConfig:
     """Settings for ball and player tracking."""
 
-    kalman_process_noise: float = 0.03
-    kalman_measurement_noise: float = 0.1
-    max_ball_gap_frames: int = 10  # max frames to interpolate missing ball
+    # --- offline ball-track linking (see ball_tracker.py) ---
+    max_ball_gap_frames: int = 18  # a tracklet may bridge this many source frames without a detection
+    max_ball_speed_px_per_frame: float = 25.0  # link gate grows by this per missed source frame (~1.2 frame-widths/s at 720p)
+    link_slack_px: int = 24  # base link gate, absorbs detection jitter
+    max_link_jump_px: int = 160  # gate cap: longer hops are left to the tracklet chain (with its teleport penalty)
+    edge_margin_px: int = 8  # ball candidates centred this close to the frame border are dropped (partial boxes, fixtures)
+    min_tracklet_detections: int = 3  # shorter tracklets are noise
+    tracklet_size_ratio_max: float = 2.5  # consecutive ball boxes must be within this size ratio
+    compensate_camera_motion: bool = True  # link in rim/player-anchored coordinates so pans don't break tracks
+    static_span_px: int = 40  # tracklets whose compensated extent stays under this...
+    static_clutter_sec: float = 1.0  # ...for at least this long are fixtures, not the ball
+    motion_full_span_px: int = 200  # compensated extent at which a tracklet gets full motion credit in scoring
+    teleport_penalty_per_px: float = 0.05  # chain penalty for jumps the ball could not have made
     shot_min_arc_height_px: int = 50  # minimum arc height to count as a shot attempt
     shot_arc_end_descent_px: int = 50  # descent below peak that terminates an arc
     hoop_proximity_px: int = 80  # pixels from hoop center to count as "through hoop"
     hoop_x_tolerance_ratio: float = 0.3  # horizontal tolerance as fraction of hoop bbox width
     hoop_entry_y_margin_px: int = 30  # vertical margin above/below hoop top for entry detection
     hoop_obs_max_age_frames: int = 30  # ignore hoop observations further than this from a shot's descent
-    max_ball_jump_px: int = 200  # max pixel distance from predicted position to accept a detection
-    ball_gate_weight: float = 0.5  # blend factor: 0=pure confidence, 1=pure proximity-to-prediction
-    reacquire_after_gap_frames: int = 5  # after this many missed frames, accept any detection
     shot_hoop_x_range_ratio: float = 0.35  # max horizontal distance from hoop (as fraction of frame width)
     shot_require_peak_above_rim: bool = True  # when a rim is in view, the arc must peak at/above it
     shot_peak_rim_margin_px: int = 20  # slack below the rim top still accepted as "above"
@@ -70,9 +77,8 @@ class TrackingConfig:
     shot_max_arc_sec: float = 3.0  # max wall-clock duration of a single arc (source frames / fps)
     shot_pre_peak_sec: float = 0.5  # max time before peak to include in shot event window
     shot_post_arc_sec: float = 0.35  # extra time past arc_end to check for made shot (backboard bounces)
-    consensus_required: int = 3  # min detections in window to confirm ball (1=disabled)
-    consensus_window: int = 5  # rolling window size for consensus check
-    consensus_max_spread_px: int = 100  # max spatial spread for consensus candidates
+    rim_entry_enabled: bool = True  # a descending ball that vanishes inside the rim footprint counts as a shot
+    rim_entry_lookahead_sec: float = 0.6  # ...and a make, unless it is re-detected above the rim within this time
     use_polygon_zone: bool = False  # use supervision PolygonZone for made-shot fallback
     deepsort_max_age: int = 30
     deepsort_n_init: int = 3

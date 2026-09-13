@@ -188,11 +188,12 @@ def main(argv: list[str] | None = None) -> int:
         help="IoU threshold for NMS deduplication (default: 0.5)",
     )
     parser.add_argument(
-        "--consensus",
+        "--min-track-detections", "--consensus",
+        dest="min_track_detections",
         type=int,
         default=3,
-        help="Multi-frame consensus: min detections to confirm ball tracking "
-        "(1=disabled; default: 3)",
+        help="Minimum detections for a ball tracklet to count (default: 3). "
+        "Single stray 'ball' boxes never form a track.",
     )
     parser.add_argument(
         "--polygon-zone",
@@ -331,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         tracking=TrackingConfig(
             enable_player_tracking=not args.no_players,
-            consensus_required=args.consensus,
+            min_tracklet_detections=args.min_track_detections,
             use_polygon_zone=args.polygon_zone,
         ),
         events=EventConfig(

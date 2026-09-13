@@ -4,7 +4,7 @@ Automatically detect interesting plays in basketball game footage — made shots
 
 The tool works in two steps:
 
-1. **Analyze** — A standalone Python engine processes your video and audio outside of Resolve, detecting events using computer vision (YOLO object detection, Kalman filter ball tracking) and audio analysis (crowd excitement scoring, whistle detection). It produces a JSON file.
+1. **Analyze** — A standalone Python engine processes your video and audio outside of Resolve, detecting events using computer vision (YOLO/Roboflow object detection, offline ball-track linking) and audio analysis (crowd excitement scoring, whistle detection). It produces a JSON file.
 2. **Import** — A small Resolve script reads that JSON and drops color-coded markers onto your timeline, right where the action happens.
 
 Because the analysis runs independently, you can process footage on any machine — even a headless GPU server — and bring the results back to your editing workstation.
@@ -109,7 +109,7 @@ you need wider compatibility.)
 
 The analyzer processes each clip's used portion, running:
 - **YOLO object detection** — finds the basketball, hoop, and players in each frame
-- **Ball tracking** — follows the ball across frames with a spatially-gated Kalman filter (rejects false detections far from predicted position)
+- **Ball tracking** — links every frame's ball candidates into tracklets after the clip is detected, in camera-motion-compensated coordinates, and picks the chain that best explains one ball (stray boxes and static fixtures are rejected)
 - **Shot detection** — validates arcs against multiple gates (duration, descent quality, hoop direction) and determines made vs. miss
 - **Player tracking** — tracks players with DeepSORT, classifies teams by jersey color
 - **Crowd excitement** — analyzes audio mel-spectrograms in the 500–4000 Hz band for roar peaks
@@ -224,8 +224,8 @@ RF-DETR backend (only used with --detector rfdetr; see "Detection Backends"):
 Detection post-processing (all backends):
   --nms                    Deduplicate overlapping boxes via supervision NMS
   --nms-threshold FLOAT    IoU threshold for NMS (default: 0.5)
-  --consensus N            Require N consistent ball detections before starting
-                           a track (1=disabled; default: 3)
+  --min-track-detections N Minimum detections for a ball tracklet to count
+                           (default: 3); --consensus is accepted as an alias
   --polygon-zone           Also count a made shot when the descent enters a
                            trapezoidal net zone below the rim (needs supervision)
 
@@ -292,7 +292,7 @@ The analyzer supports three detection backends, selected with `--detector`:
 > `--roboflow-model` as a supplement, or load a basketball fine-tune.
 
 All backends can be combined with `--nms` (deduplicate overlapping boxes),
-`--consensus N` (require N consistent ball detections before starting a track),
+`--min-track-detections N` (minimum detections for a ball tracklet),
 and `--roboflow-model` (supplemental hoop/ball detection for the YOLO/RF-DETR
 backends). Class names from every model are normalised to roles (`ball`,
 `ball-in-basket`, `hoop`/`rim`, `player`, `referee`) in
@@ -346,7 +346,7 @@ Example — fine-tuned RF-DETR with the 10-class basketball dataset:
 basketball-analyze --timeline timeline.json --clip 0 \
   --detector rfdetr --rfdetr-weights ./basketball-rfdetr.pth \
   --rfdetr-classes ball,ball-in-basket,number,player,player-in-possession,player-jump-shot,player-layup-dunk,player-shot-block,referee,rim \
-  --nms --consensus 3 -o analysis.json
+  --nms -o analysis.json
 ```
 
 `.pt` and `.pth` weight files are gitignored — keep them out of the repo.
@@ -360,7 +360,7 @@ basketball-analyze --timeline timeline.json --clip 0 \
 ```
 Video file ──┬──► Scene Detection (PySceneDetect)
              │
-             ├──► Object Detection (YOLO) ──► Ball Tracking (spatially-gated Kalman filter)
+             ├──► Object Detection (YOLO) ──► Ball Tracking (offline tracklet linking)
              │                                       │
              │                                       ├──► Shot Detection
              │                                       │    (arc validation + hoop-directed descent)
@@ -413,7 +413,7 @@ Resolve-basketball-analysis/
 │   │   ├── video_analyzer.py        # Pipeline orchestrator (single + timeline modes)
 │   │   ├── audio_analyzer.py        # Crowd excitement + whistle detection
 │   │   ├── object_detector.py       # YOLO / RF-DETR + Roboflow detection (ball, hoop, players)
-│   │   ├── ball_tracker.py          # Kalman filter tracking + shot detection
+│   │   ├── ball_tracker.py          # Offline tracklet linking + shot detection
 │   │   ├── player_tracker.py        # DeepSORT tracking + team color classification
 │   │   ├── scene_detector.py        # PySceneDetect wrapper
 │   │   ├── event_classifier.py      # Multi-modal event fusion

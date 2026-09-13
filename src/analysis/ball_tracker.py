@@ -1,12 +1,31 @@
-"""Ball tracking with Kalman filter and shot detection logic."""
+"""Offline ball tracking and shot detection.
+
+The analyser works on finished clips, so ball tracking does not have to be
+causal.  Instead of committing to one detection per frame as it arrives (and
+snapping onto a head or a light the moment the ball is missed), the tracker:
+
+1. **records** every ball candidate per analysed frame during the detection
+   pass (:meth:`BallTracker.update`),
+2. **links** candidates into *tracklets* by motion consistency once the clip
+   is done — a candidate joins a tracklet if it lies where that tracklet's
+   velocity (in camera-motion-compensated coordinates) says the ball should
+   be, within a gate that widens with the number of missed frames,
+3. **selects** the chain of non-overlapping tracklets that best explains one
+   ball with a dynamic programme over time; long, motionless tracklets
+   (fixtures, signs, heads) are discarded as clutter, and
+4. **finds shot arcs per tracklet**, so a break in the track is a break in
+   the trajectory rather than a straight line across the gym.
+
+Linking a handful of boxes per frame costs microseconds; runtime is dominated
+by the detector, not by anything here.
+"""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
-from filterpy.kalman import KalmanFilter
 
 from src.analysis.object_detector import Detection, FrameDetections
 from src.config import TrackingConfig
@@ -21,17 +40,7 @@ class BallPosition:
     frame_idx: int
     x: int
     y: int
-    predicted: bool  # True if interpolated/predicted rather than detected
-
-
-@dataclass
-class _ConsensusCandidate:
-    """A candidate ball detection pending consensus confirmation."""
-
-    frame_idx: int
-    x: int
-    y: int
-    confidence: float
+    predicted: bool  # True if interpolated across a gap rather than detected
 
 
 @dataclass
@@ -67,12 +76,52 @@ class ShotEvent:
     peak_frame: int | None = None
 
 
-class BallTracker:
-    """Tracks basketball position across frames and detects shot attempts.
+@dataclass
+class _Candidate:
+    """One ball detection, in raw image coordinates."""
 
-    Uses a Kalman filter to smooth the ball trajectory and interpolate
-    across frames where detection is missing. Shot detection looks for
-    an arc trajectory that passes through or near the hoop position.
+    frame_idx: int
+    x: int
+    y: int
+    size: float  # sqrt(area) — scale check when linking
+    confidence: float
+
+
+@dataclass
+class _Frame:
+    """Everything the linker needs from one analysed frame."""
+
+    frame_idx: int
+    balls: list[_Candidate]
+    player_centers: list[tuple[int, int]]
+    hoop_center: tuple[int, int] | None
+
+
+@dataclass
+class Tracklet:
+    """A run of detections believed to be the same object."""
+
+    dets: list[_Candidate]
+    score: float = 0.0
+    span_px: float = 0.0  # extent of the tracklet in camera-compensated coordinates
+    motion_ratio: float = 0.0  # span_px / motion_full_span_px, capped at 1
+    positions: list[BallPosition] = field(default_factory=list)  # filled after selection
+
+    @property
+    def start_frame(self) -> int:
+        return self.dets[0].frame_idx
+
+    @property
+    def end_frame(self) -> int:
+        return self.dets[-1].frame_idx
+
+    @property
+    def last(self) -> _Candidate:
+        return self.dets[-1]
+
+
+class BallTracker:
+    """Records ball candidates per frame and builds the ball trajectory offline.
 
     Args:
         config: Tracking thresholds.
@@ -93,237 +142,84 @@ class BallTracker:
         self.config = config or TrackingConfig()
         self.fps = fps if fps and fps > 0 else 30.0
         self._frame_width: int | None = frame_size[0] if frame_size else None
-        self._kf = self._init_kalman()
+        self._frame_height: int | None = frame_size[1] if frame_size else None
+        self._frames: list[_Frame] = []
         self._positions: list[BallPosition] = []
-        self._last_detection_frame: int = -1
+        self._segments: list[list[BallPosition]] = []
+        self._tracklets: list[Tracklet] = []
+        self._built = False
         self._hoop_observations: list[HoopObservation] = []
         self._median_hoop: tuple[int, int] | None = None
         self._ball_in_basket_frames: list[int] = []
-        self._consensus_buffer: list[_ConsensusCandidate] = []
-        self._consensus_confirmed: bool = False
-
-    def _init_kalman(self) -> KalmanFilter:
-        """Initialize a 2D position+velocity Kalman filter."""
-        kf = KalmanFilter(dim_x=4, dim_z=2)
-        dt = 1.0  # one analysed frame per step
-
-        # State transition: [x, y, vx, vy]
-        kf.F = np.array([
-            [1, 0, dt, 0],
-            [0, 1, 0, dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1],
-        ])
-
-        # Measurement function: we observe [x, y]
-        kf.H = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
-        ])
-
-        # Covariances
-        q = self.config.kalman_process_noise
-        kf.Q *= q
-        r = self.config.kalman_measurement_noise
-        kf.R = np.eye(2) * r
-        kf.P *= 10.0
-
-        return kf
 
     def reset(self) -> None:
         """Reset tracker state for a new video or scene."""
-        self._kf = self._init_kalman()
+        self._frames = []
         self._positions = []
-        self._last_detection_frame = -1
+        self._segments = []
+        self._tracklets = []
+        self._built = False
         self._hoop_observations = []
         self._median_hoop = None
         self._ball_in_basket_frames = []
-        self._consensus_buffer = []
-        self._consensus_confirmed = False
 
     def set_frame_size(self, width: int, height: int) -> None:
-        """Record the analysed frame size (for the hoop-directed gate)."""
+        """Record the analysed frame size (hoop-directed gate, border filtering)."""
         self._frame_width = int(width)
+        self._frame_height = int(height)
 
-    def _seed_filter(self, x: int, y: int) -> None:
-        """(Re)start the Kalman filter at a position with fresh uncertainty.
-
-        Re-inflating ``P`` matters on re-acquisition: after a long track the
-        covariance has converged small, and without a reset the filter would
-        be over-confident about a velocity that no longer applies.
-        """
-        self._kf.x = np.array([x, y, 0, 0], dtype=float)
-        self._kf.P = np.eye(4) * 10.0
-
-    def _select_best_ball(
-        self, frame_detections: FrameDetections, frame_idx: int,
-    ) -> Detection | None:
-        """Select the best ball detection using confidence+proximity scoring.
-
-        Returns None if all detections are rejected by the distance gate.
-        """
-        if not frame_detections.balls:
-            return None
-
-        if self._last_detection_frame < 0:
-            return max(frame_detections.balls, key=lambda d: d.confidence)
-
-        self._kf.predict()
-        pred_x, pred_y = float(self._kf.x[0]), float(self._kf.x[1])
-
-        gap = frame_idx - self._last_detection_frame
-        reacquiring = gap > self.config.reacquire_after_gap_frames
-
-        best_ball = None
-        best_score = -1.0
-        max_jump = self.config.max_ball_jump_px
-
-        for det in frame_detections.balls:
-            dcx, dcy = det.center
-            dist = ((dcx - pred_x) ** 2 + (dcy - pred_y) ** 2) ** 0.5
-
-            if not reacquiring and dist > max_jump:
-                continue
-
-            proximity = max(0.0, 1.0 - dist / max_jump) if max_jump > 0 else 1.0
-            w = self.config.ball_gate_weight
-            score = (1.0 - w) * det.confidence + w * proximity
-
-            if score > best_score:
-                best_score = score
-                best_ball = det
-
-        return best_ball
-
-    def _handle_consensus(
-        self, frame_idx: int, cx: int, cy: int, confidence: float,
-    ) -> BallPosition | None:
-        """Build consensus before committing to a ball track.
-
-        Collects candidates in a rolling window.  Once N out of M frames
-        have detections within ``consensus_max_spread_px`` of each other,
-        consensus is confirmed and the Kalman filter is initialized.
-        """
-        self._consensus_buffer.append(
-            _ConsensusCandidate(frame_idx=frame_idx, x=cx, y=cy, confidence=confidence)
-        )
-
-        # Expire candidates by frame age, not buffer length, so consensus
-        # reflects "N detections within the last M frames".  A count-based
-        # trim would let sparse detections spread across arbitrarily many
-        # frames (e.g. 0, 100, 200) confirm consensus.
-        window = self.config.consensus_window
-        self._consensus_buffer = [
-            c for c in self._consensus_buffer if frame_idx - c.frame_idx < window
-        ]
-
-        candidates = self._consensus_buffer
-        if len(candidates) >= self.config.consensus_required:
-            xs = [c.x for c in candidates]
-            ys = [c.y for c in candidates]
-            spread = max(max(xs) - min(xs), max(ys) - min(ys))
-
-            if spread <= self.config.consensus_max_spread_px:
-                self._consensus_confirmed = True
-                best = max(candidates, key=lambda c: c.confidence)
-                self._seed_filter(best.x, best.y)
-                self._last_detection_frame = frame_idx
-
-                for c in candidates:
-                    self._positions.append(BallPosition(
-                        frame_idx=c.frame_idx, x=c.x, y=c.y, predicted=False,
-                    ))
-
-                self._consensus_buffer = []
-                # The current frame's candidate is already in the candidates
-                # list, so return the last appended position.
-                return self._positions[-1]
-
-        return None
+    # ------------------------------------------------------------------
+    # Recording (during the detection pass)
+    # ------------------------------------------------------------------
 
     def update(self, frame_detections: FrameDetections) -> BallPosition | None:
-        """Process detections for one frame and return tracked ball position.
+        """Record this frame's ball candidates.
 
-        Uses spatially-gated detection: candidates are scored by a blend of
-        confidence and proximity to the Kalman filter's predicted position.
-        Detections beyond ``max_ball_jump_px`` are rejected unless the tracker
-        is re-acquiring after an extended gap.
-
-        When ``consensus_required > 1``, new ball tracks must be confirmed by
-        multiple consistent detections before the Kalman filter is initialized.
-
-        Args:
-            frame_detections: Detections for this frame from ObjectDetector.
-
-        Returns:
-            BallPosition if ball is being tracked, None if lost.
+        Returns the highest-confidence candidate as a provisional position so
+        the live preview has something to draw; the real trajectory is built
+        by :meth:`build_tracks` once the clip is complete.
         """
         frame_idx = frame_detections.frame_idx
-
         if frame_detections.balls_in_basket:
             self._ball_in_basket_frames.append(frame_idx)
 
-        if frame_detections.balls:
-            best_ball = self._select_best_ball(frame_detections, frame_idx)
+        cands = [
+            _Candidate(
+                frame_idx=frame_idx, x=d.center[0], y=d.center[1],
+                size=float(max(1, d.area)) ** 0.5, confidence=d.confidence,
+            )
+            for d in frame_detections.balls
+            if not self._touches_border(d.center)
+        ]
+        hoop = None
+        if frame_detections.hoops:
+            hoop = max(frame_detections.hoops, key=lambda d: d.confidence).center
+        self._frames.append(_Frame(
+            frame_idx=frame_idx, balls=cands,
+            player_centers=[d.center for d in frame_detections.players],
+            hoop_center=hoop,
+        ))
+        self._built = False
 
-            if best_ball is None:
-                # All detections rejected by distance gate
-                if (
-                    self._last_detection_frame >= 0
-                    and (frame_idx - self._last_detection_frame) <= self.config.max_ball_gap_frames
-                ):
-                    px, py = int(self._kf.x[0]), int(self._kf.x[1])
-                    pos = BallPosition(frame_idx=frame_idx, x=px, y=py, predicted=True)
-                    self._positions.append(pos)
-                    return pos
-                return None
-
-            cx, cy = best_ball.center
-
-            # Consensus gate: require multiple detections before committing
-            if not self._consensus_confirmed:
-                return self._handle_consensus(frame_idx, cx, cy, best_ball.confidence)
-
-            # Normal tracking — consensus already confirmed
-            if self._last_detection_frame < 0:
-                self._seed_filter(cx, cy)
-            else:
-                # _select_best_ball() already advanced the filter with
-                # predict(); only apply the measurement update here.
-                self._kf.update(np.array([cx, cy], dtype=float))
-
-            self._last_detection_frame = frame_idx
-            pos = BallPosition(frame_idx=frame_idx, x=cx, y=cy, predicted=False)
-
-        elif (
-            self._last_detection_frame >= 0
-            and (frame_idx - self._last_detection_frame) <= self.config.max_ball_gap_frames
-        ):
-            # Ball not detected but within interpolation window — predict
-            self._kf.predict()
-            px, py = int(self._kf.x[0]), int(self._kf.x[1])
-            pos = BallPosition(frame_idx=frame_idx, x=px, y=py, predicted=True)
-        else:
-            # Ball lost — reset consensus so re-acquisition must re-confirm
-            if self._last_detection_frame >= 0:
-                self._consensus_confirmed = False
-                self._consensus_buffer = []
-                self._last_detection_frame = -1
+        if not cands:
             return None
+        best = max(cands, key=lambda c: c.confidence)
+        return BallPosition(frame_idx=frame_idx, x=best.x, y=best.y, predicted=False)
 
-        self._positions.append(pos)
-        return pos
+    def _touches_border(self, center: tuple[int, int]) -> bool:
+        """Boxes centred on the frame edge are clipped objects or fixtures, not the ball."""
+        if not self._frame_width or not self._frame_height:
+            return False
+        m = self.config.edge_margin_px
+        x, y = center
+        return x < m or y < m or x > self._frame_width - m or y > self._frame_height - m
 
     # ------------------------------------------------------------------
     # Hoop context
     # ------------------------------------------------------------------
 
     def set_hoop_positions(self, hoop_positions: list[tuple[int, int]]) -> None:
-        """Store hoop center positions (legacy API without bounding boxes).
-
-        Computes a median hoop position used by the center-proximity
-        made-shot fallback.  Prefer :meth:`set_hoop_observations`.
-        """
+        """Store hoop center positions (legacy API without bounding boxes)."""
         if hoop_positions:
             hx = int(np.median([p[0] for p in hoop_positions]))
             hy = int(np.median([p[1] for p in hoop_positions]))
@@ -332,11 +228,7 @@ class BallTracker:
             self._median_hoop = None
 
     def set_hoop_observations(self, observations: list[HoopObservation]) -> None:
-        """Store per-frame hoop observations with bounding boxes.
-
-        Enables bbox-based made-shot detection.  Also computes the median
-        hoop center for backward-compatible fallback.
-        """
+        """Store per-frame hoop observations with bounding boxes."""
         self._hoop_observations = list(observations)
         if observations:
             hx = int(np.median([o.center[0] for o in observations]))
@@ -384,19 +276,247 @@ class BallTracker:
         return min(candidates, key=key)
 
     # ------------------------------------------------------------------
+    # Offline track building
+    # ------------------------------------------------------------------
+
+    def build_tracks(self) -> list[Tracklet]:
+        """Link recorded candidates into tracklets and choose the ball's chain.
+
+        Populates ``_positions`` / ``_segments``.  Safe to call repeatedly.
+        """
+        if self._built:
+            return self._tracklets
+        if not self._frames:
+            # Positions may have been supplied directly (tests / legacy)
+            self._segments = [self._positions] if self._positions else []
+            self._built = True
+            return []
+
+        cum_shift = self._camera_shifts()
+        tracklets = self._link_tracklets(cum_shift)
+        self._score_tracklets(tracklets, cum_shift)
+        chosen = self._select_chain(tracklets, cum_shift)
+
+        for t in chosen:
+            t.positions = self._fill_positions(t)
+        self._tracklets = chosen
+        self._segments = [t.positions for t in chosen]
+        self._positions = [p for seg in self._segments for p in seg]
+        self._built = True
+
+        logger.info(
+            "Ball tracks: %d tracklets from %d candidates, %d chosen covering %d positions",
+            len(tracklets), sum(len(f.balls) for f in self._frames),
+            len(chosen), len(self._positions),
+        )
+        return chosen
+
+    def _camera_shifts(self) -> dict[int, tuple[float, float]]:
+        """Cumulative image shift per analysed frame due to camera motion.
+
+        The rim is the ideal anchor (it doesn't move); when it isn't in both
+        frames, the median displacement of matched player boxes is used — the
+        players' own motion is small and incoherent next to a pan.
+        """
+        cum: dict[int, tuple[float, float]] = {}
+        cx = cy = 0.0
+        prev: _Frame | None = None
+        for fr in self._frames:
+            dx = dy = 0.0
+            if prev is not None and self.config.compensate_camera_motion:
+                shift = None
+                if fr.hoop_center and prev.hoop_center:
+                    hx, hy = fr.hoop_center[0] - prev.hoop_center[0], fr.hoop_center[1] - prev.hoop_center[1]
+                    if abs(hx) + abs(hy) < 150:  # same rim, not a swap between baskets
+                        shift = (hx, hy)
+                if shift is None and len(fr.player_centers) >= 3 and len(prev.player_centers) >= 3:
+                    dxs, dys = [], []
+                    for (px, py) in fr.player_centers:
+                        best = min(prev.player_centers, key=lambda q: abs(q[0] - px) + abs(q[1] - py))
+                        if abs(best[0] - px) + abs(best[1] - py) < 120:
+                            dxs.append(px - best[0])
+                            dys.append(py - best[1])
+                    if len(dxs) >= 3:
+                        shift = (float(np.median(dxs)), float(np.median(dys)))
+                if shift is not None:
+                    dx, dy = shift
+            cx += dx
+            cy += dy
+            cum[fr.frame_idx] = (cx, cy)
+            prev = fr
+        return cum
+
+    def _link_tracklets(self, cum_shift: dict[int, tuple[float, float]]) -> list[Tracklet]:
+        """Greedy nearest-prediction linking in camera-compensated coordinates."""
+        cfg = self.config
+        max_speed = cfg.max_ball_speed_px_per_frame
+        slack = cfg.link_slack_px
+        max_gap = cfg.max_ball_gap_frames
+        size_ratio = cfg.tracklet_size_ratio_max
+
+        def comp(c: _Candidate) -> tuple[float, float]:
+            sx, sy = cum_shift.get(c.frame_idx, (0.0, 0.0))
+            return c.x - sx, c.y - sy
+
+        def velocity(t: Tracklet) -> tuple[float, float]:
+            if len(t.dets) < 2:
+                return 0.0, 0.0
+            a, b = t.dets[-2], t.dets[-1]
+            dt = max(1, b.frame_idx - a.frame_idx)
+            ax, ay = comp(a)
+            bx, by = comp(b)
+            # Damp so a single noisy step doesn't fling the prediction
+            return 0.8 * (bx - ax) / dt, 0.8 * (by - ay) / dt
+
+        active: list[Tracklet] = []
+        finished: list[Tracklet] = []
+
+        for fr in self._frames:
+            still: list[Tracklet] = []
+            for t in active:
+                (finished if fr.frame_idx - t.end_frame > max_gap else still).append(t)
+            active = still
+
+            preds = []
+            for t in active:
+                dt = fr.frame_idx - t.end_frame
+                vx, vy = velocity(t)
+                lx, ly = comp(t.last)
+                gate = min(slack + max_speed * dt, float(cfg.max_link_jump_px))
+                preds.append((lx + vx * dt, ly + vy * dt, gate))
+
+            pairs = []
+            for i, t in enumerate(active):
+                px, py, gate = preds[i]
+                for j, c in enumerate(fr.balls):
+                    cx, cy = comp(c)
+                    d = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+                    if d > gate:
+                        continue
+                    ratio = max(c.size, t.last.size) / max(1e-6, min(c.size, t.last.size))
+                    if ratio > size_ratio:
+                        continue
+                    pairs.append((d, i, j))
+            pairs.sort()
+
+            used_t: set[int] = set()
+            used_c: set[int] = set()
+            for d, i, j in pairs:
+                if i in used_t or j in used_c:
+                    continue
+                active[i].dets.append(fr.balls[j])
+                used_t.add(i)
+                used_c.add(j)
+            for j, c in enumerate(fr.balls):
+                if j not in used_c:
+                    active.append(Tracklet(dets=[c]))
+
+        finished.extend(active)
+        return [t for t in finished if len(t.dets) >= cfg.min_tracklet_detections]
+
+    def _score_tracklets(self, tracklets: list[Tracklet], cum_shift: dict) -> None:
+        """Score by evidence (count × confidence), discounting things that don't move.
+
+        Motion is the tracklet's *extent* in camera-compensated coordinates,
+        not per-step displacement: detection jitter on a tiny fixture is a
+        few px every step, but it never goes anywhere.
+        """
+        full = max(1, self.config.motion_full_span_px)
+        for t in tracklets:
+            xs, ys = [], []
+            for d in t.dets:
+                sx, sy = cum_shift.get(d.frame_idx, (0.0, 0.0))
+                xs.append(d.x - sx)
+                ys.append(d.y - sy)
+            t.span_px = max(max(xs) - min(xs), max(ys) - min(ys))
+            t.motion_ratio = min(1.0, t.span_px / full)
+            mean_conf = float(np.mean([d.confidence for d in t.dets]))
+            t.score = len(t.dets) * mean_conf * (0.25 + 0.75 * t.motion_ratio)
+
+    def _select_chain(self, tracklets: list[Tracklet], cum_shift: dict) -> list[Tracklet]:
+        """Dynamic programme: best-scoring chain of time-disjoint tracklets.
+
+        Motionless tracklets that last a while are clutter, not a ball in
+        play, and are excluded up front so they cannot out-score the real
+        ball by sheer length.
+        """
+        cfg = self.config
+        clutter_frames = cfg.static_clutter_sec * self.fps
+        usable = [
+            t for t in tracklets
+            if not (t.span_px < cfg.static_span_px and t.end_frame - t.start_frame >= clutter_frames)
+        ]
+        usable.sort(key=lambda t: (t.start_frame, t.end_frame))
+        n = len(usable)
+        if n == 0:
+            return []
+
+        def comp(c: _Candidate) -> tuple[float, float]:
+            sx, sy = cum_shift.get(c.frame_idx, (0.0, 0.0))
+            return c.x - sx, c.y - sy
+
+        best = [0.0] * n
+        prev = [-1] * n
+        for i, ti in enumerate(usable):
+            best[i] = ti.score
+            for j in range(i):
+                tj = usable[j]
+                if tj.end_frame >= ti.start_frame:
+                    continue
+                gap = ti.start_frame - tj.end_frame
+                ax, ay = comp(tj.last)
+                bx, by = comp(ti.dets[0])
+                dist = ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5
+                # Penalise teleports the ball could not have made in the gap
+                excess = max(0.0, dist - cfg.max_ball_speed_px_per_frame * gap)
+                cand = best[j] + ti.score - cfg.teleport_penalty_per_px * excess
+                if cand > best[i]:
+                    best[i] = cand
+                    prev[i] = j
+
+        i = int(np.argmax(best))
+        chain = []
+        while i >= 0:
+            chain.append(usable[i])
+            i = prev[i]
+        chain.reverse()
+        return chain
+
+    def _fill_positions(self, t: Tracklet) -> list[BallPosition]:
+        """Detections as positions, with gaps linearly interpolated (predicted=True)."""
+        step = self._analysis_step()
+        out: list[BallPosition] = []
+        for a, b in zip(t.dets, t.dets[1:]):
+            out.append(BallPosition(a.frame_idx, a.x, a.y, predicted=False))
+            gap = b.frame_idx - a.frame_idx
+            if gap > step:
+                for f in range(a.frame_idx + step, b.frame_idx, step):
+                    u = (f - a.frame_idx) / gap
+                    out.append(BallPosition(
+                        f, int(round(a.x + (b.x - a.x) * u)), int(round(a.y + (b.y - a.y) * u)),
+                        predicted=True,
+                    ))
+        last = t.dets[-1]
+        out.append(BallPosition(last.frame_idx, last.x, last.y, predicted=False))
+        return out
+
+    def _analysis_step(self) -> int:
+        """Source frames between consecutive analysed frames (frame_skip)."""
+        if len(self._frames) < 2:
+            return 1
+        return max(1, self._frames[1].frame_idx - self._frames[0].frame_idx)
+
+    # ------------------------------------------------------------------
     # Shot detection
     # ------------------------------------------------------------------
 
     def find_shots(self) -> list[ShotEvent]:
-        """Find shot events from already-accumulated ball positions.
-
-        Uses positions collected via update() calls and the hoop context set
-        via set_hoop_positions() / set_hoop_observations().
-        """
-        if len(self._positions) < 5:
-            return []
-
-        shots = self._find_arcs(self._median_hoop)
+        """Find shot events on the built ball trajectory."""
+        self.build_tracks()
+        shots: list[ShotEvent] = []
+        for seg in self._segments:
+            if len(seg) >= 5:
+                shots.extend(self._find_arcs(seg, self._median_hoop))
         logger.info("Detected %d shot events", len(shots))
         return shots
 
@@ -406,15 +526,9 @@ class BallTracker:
     ) -> list[ShotEvent]:
         """Analyze a full detection sequence to find shot attempts and makes."""
         self.reset()
-
-        for fd in all_detections:
-            self.update(fd)
-
-        if len(self._positions) < 5:
-            return []
-
         observations = []
         for fd in all_detections:
+            self.update(fd)
             if fd.hoops:
                 best_hoop = max(fd.hoops, key=lambda d: d.confidence)
                 observations.append(HoopObservation(
@@ -422,23 +536,19 @@ class BallTracker:
                     center=best_hoop.center, confidence=best_hoop.confidence,
                 ))
         self.set_hoop_observations(observations)
+        return self.find_shots()
 
-        shots = self._find_arcs(self._median_hoop)
-        logger.info("Detected %d shot events", len(shots))
-        return shots
+    def _find_arcs(
+        self, positions: list[BallPosition], hoop_pos: tuple[int, int] | None,
+    ) -> list[ShotEvent]:
+        """Find up-then-down arcs in one contiguous trajectory segment.
 
-    def _find_arcs(self, hoop_pos: tuple[int, int] | None) -> list[ShotEvent]:
-        """Find ball arc trajectories that look like shot attempts.
-
-        Scans the (sparse) position list for up-then-down motion.  All
-        duration windows are measured in *source frames* via each position's
-        ``frame_idx`` — never in list indices, because the list has holes
-        wherever the ball was lost.  A gap longer than ``max_ball_gap_frames``
-        between consecutive positions terminates the current arc: a ball that
-        was lost and re-acquired somewhere else is not one trajectory.
+        All duration windows are measured in *source frames* via each
+        position's ``frame_idx``.  A gap longer than ``max_ball_gap_frames``
+        between consecutive positions still terminates the current arc (a
+        safety net for positions supplied directly rather than built here).
         """
         shots: list[ShotEvent] = []
-        positions = self._positions
         n = len(positions)
         max_gap = self.config.max_ball_gap_frames
         end_descent = self.config.shot_arc_end_descent_px
@@ -448,12 +558,18 @@ class BallTracker:
             arc_start = i
             peak_idx: int | None = None
             min_y = positions[i].y
+            terminated = False
 
             j = i + 1
             while j < n:
                 if positions[j].frame_idx - positions[j - 1].frame_idx > max_gap:
-                    # Track break — restart the scan at the re-acquired point
+                    # Track break.  If the ball was on its way down when it
+                    # vanished, it may have dropped into the net.
+                    shot = self._try_rim_entry(positions, arc_start, peak_idx, j - 1, min_y, hoop_pos)
+                    if shot is not None:
+                        shots.append(shot)
                     i = j - 1
+                    terminated = True
                     break
 
                 curr = positions[j]
@@ -465,32 +581,97 @@ class BallTracker:
                     and not curr.predicted
                     and curr.y > min_y + end_descent
                 ):
-                    # Ball has descended significantly past the peak — end of
-                    # arc.  Only a *detected* position may terminate an arc;
-                    # Kalman extrapolation must not manufacture a descent.
-                    shot, next_i = self._evaluate_arc(arc_start, peak_idx, j, min_y, hoop_pos)
+                    # Only a *detected* position may terminate an arc;
+                    # interpolation must not manufacture a descent.
+                    shot, next_i = self._evaluate_arc(positions, arc_start, peak_idx, j, min_y, hoop_pos)
                     if shot is not None:
                         shots.append(shot)
                     i = next_i
+                    terminated = True
                     break
                 j += 1
+
+            if not terminated:
+                # Segment ended without a full descent — same rim-entry check
+                shot = self._try_rim_entry(positions, arc_start, peak_idx, n - 1, min_y, hoop_pos)
+                if shot is not None:
+                    shots.append(shot)
+                    break
             i += 1
 
         return shots
 
+    def _try_rim_entry(
+        self,
+        positions: list[BallPosition],
+        arc_start: int,
+        peak_idx: int | None,
+        last_idx: int,
+        min_y: int,
+        hoop_pos: tuple[int, int] | None,
+    ) -> ShotEvent | None:
+        """A shot whose ball disappeared into the rim before a full descent.
+
+        The detector loses the ball as it enters the net, so a made shot
+        from just above the rim often shows only a few descending pixels
+        before the track ends.  If the last *detected* position sits inside
+        the rim's footprint after a peak, treat the arc as a shot ending
+        there; :meth:`_evaluate_arc` decides made/miss with a look-ahead.
+        """
+        cfg = self.config
+        if not cfg.rim_entry_enabled or peak_idx is None or last_idx <= peak_idx:
+            return None
+        last = positions[last_idx]
+        if last.predicted or last.y <= min_y:
+            return None
+        sel_obs = self._select_hoop_observation(positions[peak_idx: last_idx + 1])
+        if sel_obs is None:
+            return None
+        hx1, hy1, hx2, hy2 = sel_obs.bbox
+        tol = (hx2 - hx1) * cfg.hoop_x_tolerance_ratio
+        in_x = (hx1 - tol) <= last.x <= (hx2 + tol)
+        in_y = (hy1 - cfg.hoop_entry_y_margin_px) <= last.y <= hy2 + (hy2 - hy1)
+        if not (in_x and in_y):
+            return None
+        shot, _ = self._evaluate_arc(
+            positions, arc_start, peak_idx, last_idx, min_y, hoop_pos, rim_entry=sel_obs,
+        )
+        return shot
+
+    def _rim_entry_verdict(self, last: BallPosition, obs: HoopObservation) -> bool:
+        """Made unless the ball is re-detected above the rim shortly after vanishing.
+
+        A rim-out bounces back into view above the rim; a make falls through
+        the net and is next seen (if at all) below it.
+        """
+        hy2 = obs.bbox[3]
+        horizon = last.frame_idx + self.config.rim_entry_lookahead_sec * self.fps
+        for p in self._positions:
+            if p.frame_idx <= last.frame_idx or p.predicted:
+                continue
+            if p.frame_idx > horizon:
+                break
+            return p.y > hy2
+        return True
+
     def _evaluate_arc(
         self,
+        positions: list[BallPosition],
         arc_start: int,
         peak_idx: int,
         arc_end: int,
         min_y: int,
         hoop_pos: tuple[int, int] | None,
+        rim_entry: HoopObservation | None = None,
     ) -> tuple[ShotEvent | None, int]:
         """Validate a candidate arc and build a ShotEvent.
 
+        ``rim_entry`` is the rim the ball vanished into when the arc was cut
+        short (see :meth:`_try_rim_entry`); the descent-ratio gate is skipped
+        and made/miss comes from the look-ahead verdict.
+
         Returns ``(shot_or_None, index_to_resume_scanning_from)``.
         """
-        positions = self._positions
         n = len(positions)
         cfg = self.config
         fps = self.fps
@@ -512,10 +693,10 @@ class BallTracker:
             )
             return None, arc_end
 
-        # Gate B: minimum descent ratio
+        # Gate B: minimum descent ratio (not for a ball that vanished into the rim)
         descent_height = positions[arc_end].y - min_y
         d_ratio = descent_height / arc_height if arc_height > 0 else 0.0
-        if d_ratio < cfg.shot_min_descent_ratio:
+        if rim_entry is None and d_ratio < cfg.shot_min_descent_ratio:
             logger.debug(
                 "Arc rejected (Gate B: descent_ratio): %.3f < %.3f (frames %d-%d)",
                 d_ratio, cfg.shot_min_descent_ratio, start_frame, end_frame,
@@ -524,11 +705,8 @@ class BallTracker:
 
         # Which rim (if any) should judge this arc?
         descent_positions = positions[peak_idx: arc_end + 1]
-        sel_obs = self._select_hoop_observation(descent_positions)
-        if sel_obs is not None:
-            hoop_xy: tuple[int, int] | None = sel_obs.center
-        else:
-            hoop_xy = hoop_pos
+        sel_obs = rim_entry if rim_entry is not None else self._select_hoop_observation(descent_positions)
+        hoop_xy: tuple[int, int] | None = sel_obs.center if sel_obs is not None else hoop_pos
 
         # Gate C: hoop-directed descent
         hoop_x_dist: float | None = None
@@ -548,9 +726,8 @@ class BallTracker:
                 )
                 return None, arc_end
 
-        # Gate D: a shot at this rim has to get above it.  Passes, dribbles and
-        # hand-offs produce up-and-down arcs too, but they stay below rim
-        # height, and a real shot must be higher than the rim where it meets it.
+        # Gate D: a shot at this rim has to get above it.  Passes, dribbles
+        # and hand-offs trace up-and-down arcs too, but stay below rim height.
         if sel_obs is not None and cfg.shot_require_peak_above_rim:
             rim_top = sel_obs.bbox[1]
             if min_y > rim_top + cfg.shot_peak_rim_margin_px:
@@ -571,8 +748,7 @@ class BallTracker:
             effective_start += 1
 
         # Extend the made-shot window past arc_end to catch backboard bounces
-        # that drop through after the descent trigger — but never across a
-        # track break.
+        # that drop through after the descent trigger — never across a break.
         post_arc_frames = cfg.shot_post_arc_sec * fps
         made_end = arc_end
         while (
@@ -588,7 +764,11 @@ class BallTracker:
         made: bool | None = None
         made_via: str | None = None
         hoop_bbox: tuple[int, int, int, int] | None = None
-        if sel_obs is not None:
+        if rim_entry is not None:
+            made = self._rim_entry_verdict(positions[arc_end], rim_entry)
+            made_via = "rim_entry" if made else "rim_out"
+            hoop_bbox = rim_entry.bbox
+        elif sel_obs is not None:
             made, hoop_bbox = self._check_ball_through_hoop_bbox(made_positions, [sel_obs])
             made_via = "bbox" if made else None
             if not made and cfg.use_polygon_zone:
@@ -656,15 +836,10 @@ class BallTracker:
         Looks at the descent phase of the arc (after the peak) and checks:
         1. Ball is horizontally within the hoop bbox (expanded by tolerance)
         2. Ball transitions from above hoop top to below it
-
-        Returns:
-            (made, hoop_bbox) — True and the matched hoop bbox if a through-
-            hoop transition was detected, otherwise (False, None).
         """
         if not positions or not hoop_observations:
             return False, None
 
-        # Find the peak of the arc (minimum y in image coords)
         peak_idx = min(range(len(positions)), key=lambda k: positions[k].y)
         descent = positions[peak_idx:]
         if len(descent) < 2:
@@ -679,19 +854,14 @@ class BallTracker:
         tolerance = hoop_w * self.config.hoop_x_tolerance_ratio
         margin = self.config.hoop_entry_y_margin_px
 
-        # Check for a ball position above the hoop followed by one at/below it.
-        # In image coords, smaller y = higher in the frame.
         above = False
         for pos in descent:
             in_x = (hx1 - tolerance) <= pos.x <= (hx2 + tolerance)
             if not in_x:
                 continue
-
             if pos.y <= hy1 - margin:
-                # Ball is clearly above the hoop top
                 above = True
             elif above and pos.y >= hy1:
-                # Ball was above hoop top and has now reached/crossed it
                 return True, best_obs.bbox
 
         return False, None
@@ -701,11 +871,9 @@ class BallTracker:
         positions: list[BallPosition],
         hoop_observation: HoopObservation,
     ) -> bool:
-        """Check if ball positions fall within a polygon zone around the hoop.
+        """Check if descent positions fall within a trapezoidal net zone.
 
-        Constructs a trapezoidal polygon from the hoop bounding box that
-        extends downward to account for the net area.  Requires the
-        ``supervision`` package; returns False if not available.
+        Requires the ``supervision`` package; returns False if not available.
         """
         try:
             import supervision as sv
@@ -728,7 +896,6 @@ class BallTracker:
 
         zone = sv.PolygonZone(polygon=polygon)
 
-        # Check descent positions (after peak)
         peak_idx = min(range(len(positions)), key=lambda k: positions[k].y)
         descent = positions[peak_idx:]
         if len(descent) < 2:

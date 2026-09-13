@@ -9,7 +9,7 @@ The engine uses a six-phase pipeline to detect basketball game events from video
 1. **Scene Detection** -- Identify shot/scene boundaries using frame-to-frame HSV comparison
 2. **Audio Analysis** -- Extract crowd excitement peaks and referee whistle events from the audio track
 3. **Object Detection** -- Run YOLO inference to locate the basketball, hoop, and players in each frame
-4. **Ball Tracking** -- Smooth ball trajectory with a Kalman filter and detect shot arcs
+4. **Ball Tracking** -- Link per-frame ball candidates into tracklets offline, pick the ball's chain, detect shot arcs
 5. **Player Tracking** -- Maintain player identity across frames with DeepSORT and classify teams by jersey color
 6. **Event Classification** -- Fuse video and audio signals into final `GameEvent` objects with confidence scores
 
@@ -23,33 +23,38 @@ Each phase is implemented as an independent module under `src/analysis/`. The pi
 
 ### Model
 
-YOLO Medium (`yolo11m.pt`) via the Ultralytics library. The model auto-downloads on first run.
+Three backends, selected with `--detector`:
 
-Two model modes are supported:
+| Backend | Model | Hoop class? |
+|---------|-------|-------------|
+| `yolo` (default) | Ultralytics `yolo11m.pt` (auto-downloads) or any YOLO weights via `--yolo-model` | Only with a basketball fine-tune — stock COCO has none |
+| `rfdetr` | RF-DETR (`pip install rfdetr`), COCO or `--rfdetr-weights` + `--rfdetr-classes` | Only with a fine-tuned checkpoint |
+| `roboflow` | A Roboflow Universe/workspace model via `--roboflow-model ID`, run locally on ONNX by the `inference` package (needs `ROBOFLOW_API_KEY`) | Yes, if the model has a `rim`/`hoop`/`basket` class |
 
-| Mode | Detected classes | Source |
-|------|-----------------|--------|
-| **COCO (stock)** | `person` (class 0), `sports ball` (class 32) | Pre-trained YOLO |
-| **Custom** | `basketball`, `hoop`, `player` | User-trained model |
+`--roboflow-model` can also be paired with the `yolo`/`rfdetr` backends as a *supplemental* hoop/ball source; its boxes are merged into the same `FrameDetections`.
 
-The detector auto-detects which mode to use by checking if the loaded model's class names contain `"basketball"`. COCO models cannot detect the hoop -- shot detection relies on arc geometry alone unless a Roboflow model is also used (see below).
+### Class roles
 
-### Roboflow Supplemental Detection
+Every model's class names are normalised through `CLASS_ROLE_MAP` (lower-cased, `_` → `-`):
 
-An optional Roboflow model (`--roboflow-model MODEL_ID`) can supplement YOLO detection. It runs on every analyzed frame after YOLO and appends its results to the same `FrameDetections` object.
+| Role | Class names | Bucket |
+|------|-------------|--------|
+| ball | `ball`, `basketball`, `sports ball` | `fd.balls` |
+| ball-in-basket | `ball-in-basket`, `made` | `fd.balls` **and** `fd.balls_in_basket` (direct made-shot evidence) |
+| hoop | `hoop`, `rim`, `basket`, `basketball-hoop`, `hoop-rim` | `fd.hoops` |
+| player | `player`, `person`, `shooter`, `player-in-possession`, `player-jump-shot`, `player-layup-dunk`, `player-shot-block` | `fd.players` |
+| referee | `referee`, `ref` | `fd.referees` (never fed to team classification) |
+| ignore | `number`, `backboard`, `net`, `people`, `shoot` | dropped |
 
-Supported Roboflow class mappings:
+A YOLO model counts as basketball-specific when any of its class names maps to the hoop role. When no configured model can produce hoops, the detector logs a warning at start-up: made/miss classification is then impossible and every shot is reported with `made: null`.
 
-| Roboflow class | Mapped to | Appended to |
-|----------------|-----------|-------------|
-| `hoop`, `rim`, `basket` | `"hoop"` | `fd.hoops` |
-| `basketball`, `ball` | `"basketball"` | `fd.balls` |
+### Thresholds and inference size
 
-This is useful in two scenarios:
-- **Hoop detection with COCO models:** Stock YOLO has no hoop class, so Roboflow provides the hoop detections needed for made-shot classification.
-- **Supplemental ball detection:** Roboflow basketball detections can catch balls that YOLO's generic `sports ball` class misses.
+- `--yolo-confidence` / `--roboflow-confidence` gate ball and player boxes; `--hoop-confidence` (default 0.3) is a separate, looser floor for hoop boxes on every backend — rims are small and benefit from it.
+- `--imgsz` (default 1280) sets YOLO's inference size on the long edge. Ultralytics' own default of 640 shrinks a 720p ball to ~10 px.
+- With stock COCO weights only the `person` and `sports ball` classes are requested from YOLO.
 
-Requires the `inference` pip package and a `ROBOFLOW_API_KEY` environment variable. Confidence threshold is controlled by `--roboflow-confidence` (default 0.4).
+Use `scripts/bench_hoop_models.py` to compare candidate models on your own footage; results for the reference game are in `docs/model-bakeoff.md`.
 
 ### Frame Preprocessing
 
@@ -62,8 +67,8 @@ Automatic priority: CUDA > MPS (Apple Silicon) > CPU. Controlled by the `device`
 
 ### Output
 
-Each analyzed frame produces a `FrameDetections` object containing categorized lists of `Detection` objects (balls, hoops, players). Each detection stores:
-- Class name, confidence score, bounding box `(x1, y1, x2, y2)`, frame index
+Each analyzed frame produces a `FrameDetections` object containing categorized lists of `Detection` objects (balls, hoops, players, referees, balls_in_basket). Each detection stores:
+- Raw model class name, confidence score, bounding box `(x1, y1, x2, y2)`, frame index
 - Derived properties: `center` (bbox midpoint), `area` (bbox pixel area)
 
 ---
@@ -72,30 +77,17 @@ Each analyzed frame produces a `FrameDetections` object containing categorized l
 
 **Module:** `src/analysis/ball_tracker.py`
 
-### Kalman Filter
+### Offline Tracklet Linking
 
-A 4-dimensional linear Kalman filter (from `filterpy`) tracks the ball's position and velocity:
+The analyser works on finished clips, so ball tracking is **not causal**: every ball candidate in the clip is known before any tracking decision is made. (The previous design — an online Kalman filter that committed to one detection per frame and dropped its distance gate after five missed frames — snapped onto heads and light fixtures as soon as the detector offered more than one candidate per frame.)
 
-- **State vector:** `[x, y, vx, vy]` -- 2D position + 2D velocity
-- **Measurement vector:** `[x, y]` -- observed ball center from detection
-- **State transition:** Constant-velocity model with `dt = 1.0` (frame-based time steps)
-- **Process noise (Q):** Scaled by `kalman_process_noise` (default 0.03)
-- **Measurement noise (R):** Diagonal matrix scaled by `kalman_measurement_noise` (default 0.1)
-- **Initial covariance (P):** Scaled by 10.0
+1. **Record.** During the detection pass, `BallTracker.update()` stores every ball candidate per analysed frame (centre, size, confidence) plus the player centres and the rim centre. It returns the top candidate only as a provisional position for the live preview.
+2. **Camera-motion compensation.** A per-frame image shift is estimated from the rim (a perfect static anchor when visible) or the median displacement of matched player boxes, and accumulated. Linking and motion scoring run in these compensated coordinates, so a pan neither breaks a track nor makes a fixture look like it is moving. Disable with `compensate_camera_motion=False`.
+3. **Link.** Candidates are joined into *tracklets* greedily by distance to each tracklet's predicted position (last detection + damped velocity × elapsed frames). The gate is `link_slack_px + max_ball_speed_px_per_frame × frames_since_last_detection`, capped at `max_link_jump_px` — it widens while the ball is missing but can never reach across the frame; longer hops are the chain's job (step 4). Consecutive boxes must be within `tracklet_size_ratio_max` in size. A tracklet closes after `max_ball_gap_frames` without a detection; tracklets shorter than `min_tracklet_detections` are dropped, so a single stray box never becomes a track. Candidates centred within `edge_margin_px` of the frame border are never recorded (clipped boxes, ceiling fixtures).
+4. **Select.** Each tracklet is scored `detections × mean confidence × (0.25 + 0.75 × motion)`, where `motion` is the tracklet's camera-compensated *extent* relative to `motion_full_span_px` — extent, not per-step displacement, because detection jitter on a tiny fixture is a few px every step yet never goes anywhere. Tracklets whose extent stays under `static_span_px` for at least `static_clutter_sec` are discarded as clutter. A dynamic programme then picks the chain of time-disjoint tracklets with the highest total score, charging `teleport_penalty_per_px` for any jump between consecutive tracklets that exceeds what the ball could travel in the gap.
+5. **Fill.** The chosen tracklets become `BallPosition` lists; gaps inside a tracklet are linearly interpolated at the analysis cadence and flagged `predicted=True`. Each tracklet is a separate segment — shot detection never runs across a break.
 
-### Spatially-Gated Detection
-
-Rather than simply selecting the highest-confidence ball detection per frame, the tracker uses the Kalman filter's predicted position to gate incoming detections. Each candidate is scored by a weighted blend of detection confidence and proximity to the predicted position:
-
-```
-score = (1 - ball_gate_weight) * confidence + ball_gate_weight * proximity
-```
-
-where `proximity = max(0, 1 - distance / max_ball_jump_px)`. Detections beyond `max_ball_jump_px` (default 200px) from the predicted position are rejected outright. This prevents false-positive ball detections on the far side of the frame from hijacking the trajectory.
-
-After an extended tracking gap (more than `reacquire_after_gap_frames` frames with no accepted detection), the distance gate is disabled to allow the tracker to re-lock onto any detection.
-
-When all detections in a frame are rejected, the tracker falls back to Kalman prediction if still within `max_ball_gap_frames` (default 10), producing an interpolated position marked as `predicted=True`.
+Linking a handful of boxes per frame costs microseconds; the detector dominates runtime.
 
 ### Shot Arc Detection
 
@@ -103,7 +95,7 @@ Shot detection runs as a second pass over the full tracked trajectory. The algor
 
 1. Scan positions with a sliding window looking for upward motion (decreasing y in image coordinates)
 2. Track the peak (minimum y value) of the arc
-3. When a **detected** (not Kalman-predicted) position descends past the peak by at least `shot_arc_end_descent_px` (default 50px), record the arc candidate. Predicted positions never terminate an arc — extrapolation must not manufacture a descent.
+3. When a **detected** (not interpolated) position descends past the peak by at least `shot_arc_end_descent_px` (default 50px), record the arc candidate. Predicted positions never terminate an arc — extrapolation must not manufacture a descent.
 4. Compute `arc_height = start_y - peak_y`; only accept if it exceeds `shot_min_arc_height_px` (default 50px)
 5. **Maximum arc duration gate**: Reject arcs whose source-frame span exceeds `shot_max_arc_sec` (default 3.0 s). Real basketball shots take 1-2 seconds; longer arcs indicate tracking noise or continuous ball movement.
 6. **Minimum descent ratio gate**: The ball must descend at least `shot_min_descent_ratio` (default 0.15) of its ascent height after the peak. This is set low to accommodate layups, where the player carries the ball upward (inflating the measured ascent) but the actual descent through the hoop is short. Jump shots produce ratios near 1.0; layups typically produce 0.15-0.35.
@@ -133,7 +125,8 @@ These metrics are used downstream by the event classifier to adjust confidence s
 2. **Bbox crossing** (`made_via="bbox"`). The descent must contain a position clearly above the rim top (`hoop_entry_y_margin_px`) followed by a later position at/below it, both within the rim's horizontal extent expanded by `hoop_x_tolerance_ratio`.
 3. **Polygon zone** (`made_via="polygon"`, opt-in via `--polygon-zone`). A trapezoid from the rim box down through the net; a descent position inside it counts as a make. Requires `supervision`.
 4. **Ball-in-basket** (`made_via="ball_in_basket"`). If the detector emits a `ball-in-basket` class (e.g. the Roboflow 10-class basketball model) between the arc peak and the end of the post-arc window, the shot is a make regardless of geometry.
-5. **Centre proximity** (`made_via="proximity"`) is the legacy fallback used only when hoop *centres* were supplied without boxes (`set_hoop_positions`): any position within `hoop_proximity_px` of the median centre.
+5. **Rim entry** (`made_via="rim_entry"` / `"rim_out"`). The detector loses the ball as it enters the net, so a make from just above the rim often shows only a few descending pixels before the track ends. If the last *detected* position after a peak lies inside the rim's footprint (horizontal span ± tolerance, from just above the rim top to one rim-height below it) and the track then ends or breaks, the arc is accepted without the descent-ratio gate. Verdict by look-ahead: if the ball is re-detected within `rim_entry_lookahead_sec` *above* the rim bottom it rimmed out (`made=False`, `rim_out`); if it reappears below the rim, or not at all, it went in (`rim_entry`).
+6. **Centre proximity** (`made_via="proximity"`) is the legacy fallback used only when hoop *centres* were supplied without boxes (`set_hoop_positions`): any position within `hoop_proximity_px` of the median centre.
 
 ---
 
@@ -283,7 +276,7 @@ Processes one video file through the six-phase pipeline in order:
 1. Scene detection
 2. Audio analysis (extract + crowd excitement + whistle detection)
 3. Object detection (YOLO on every Nth frame, optionally supplemented by Roboflow)
-4. Ball tracking (Kalman filter + shot arc detection)
+4. Ball tracking (offline tracklet linking + shot arc detection)
 5. Player tracking (DeepSORT + team classification) — skipped when `--no-players` is set
 6. Event classification (multi-modal fusion)
 
@@ -361,18 +354,24 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `kalman_process_noise` | `float` | `0.03` | Kalman filter process noise scale |
-| `kalman_measurement_noise` | `float` | `0.1` | Kalman filter measurement noise scale |
-| `max_ball_gap_frames` | `int` | `10` | Max frames to interpolate missing ball |
+| `max_ball_gap_frames` | `int` | `18` | Source frames a tracklet may bridge without a detection |
+| `max_ball_speed_px_per_frame` | `float` | `25.0` | Link gate grows by this per missed source frame |
+| `link_slack_px` | `int` | `24` | Base link gate (detection jitter) |
+| `max_link_jump_px` | `int` | `160` | Cap on the link gate; longer hops are left to the chain selection |
+| `edge_margin_px` | `int` | `8` | Ball candidates centred this close to the frame border are ignored |
+| `min_tracklet_detections` | `int` | `3` | Shorter tracklets are dropped (`--min-track-detections`) |
+| `tracklet_size_ratio_max` | `float` | `2.5` | Max size ratio between consecutive linked boxes |
+| `compensate_camera_motion` | `bool` | `True` | Link in rim/player-anchored coordinates |
+| `static_span_px` | `int` | `40` | Tracklets whose compensated extent stays under this… |
+| `static_clutter_sec` | `float` | `1.0` | …for at least this long are discarded as fixtures |
+| `motion_full_span_px` | `int` | `200` | Compensated extent that earns full motion credit in scoring |
+| `teleport_penalty_per_px` | `float` | `0.05` | Chain penalty per px of implausible jump between tracklets |
 | `shot_min_arc_height_px` | `int` | `50` | Minimum arc height (pixels) for a shot |
 | `shot_arc_end_descent_px` | `int` | `50` | Descent below the peak (by a detected position) that ends an arc |
 | `hoop_proximity_px` | `int` | `80` | Distance (pixels) to count as through hoop (legacy centre-only fallback) |
 | `hoop_x_tolerance_ratio` | `float` | `0.3` | Horizontal tolerance as fraction of hoop bbox width |
 | `hoop_entry_y_margin_px` | `int` | `30` | Vertical margin above/below hoop top for entry detection |
 | `hoop_obs_max_age_frames` | `int` | `30` | Hoop observations further than this from a shot's descent are ignored (→ `made=None`) |
-| `max_ball_jump_px` | `int` | `200` | Max pixel distance from predicted position to accept a detection |
-| `ball_gate_weight` | `float` | `0.5` | Blend factor for gated detection: 0=pure confidence, 1=pure proximity |
-| `reacquire_after_gap_frames` | `int` | `5` | After this many missed frames, disable distance gate for re-acquisition |
 | `shot_hoop_x_range_ratio` | `float` | `0.35` | Max horizontal distance from hoop (as fraction of frame width) for arc validation |
 | `shot_require_peak_above_rim` | `bool` | `True` | Reject arcs that never rise above the rim they are judged against |
 | `shot_peak_rim_margin_px` | `int` | `20` | Slack below the rim top still accepted by the peak gate |
@@ -380,9 +379,8 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `shot_max_arc_sec` | `float` | `3.0` | Max duration of a single arc in source seconds |
 | `shot_pre_peak_sec` | `float` | `0.5` | Max time before peak to include in shot event window |
 | `shot_post_arc_sec` | `float` | `0.35` | Extra time past arc_end to check for made shot (backboard bounces) |
-| `consensus_required` | `int` | `3` | Detections within the window needed to start a ball track (1 = off; `--consensus`) |
-| `consensus_window` | `int` | `5` | Frame window for consensus |
-| `consensus_max_spread_px` | `int` | `100` | Max spatial spread among consensus candidates |
+| `rim_entry_enabled` | `bool` | `True` | A descending ball that vanishes inside the rim footprint is a shot |
+| `rim_entry_lookahead_sec` | `float` | `0.6` | …and a make unless re-detected above the rim within this time |
 | `use_polygon_zone` | `bool` | `False` | Net-zone made-shot fallback (`--polygon-zone`, needs `supervision`) |
 | `deepsort_max_age` | `int` | `30` | Frames before dropping unmatched track |
 | `deepsort_n_init` | `int` | `3` | Detections needed to confirm a track |
