@@ -231,19 +231,21 @@ class TestEndToEnd:
             num_points=12,
         )
 
-        # Feed each position as a ball detection
+        # Feed each position as a ball detection at the real analysis cadence
+        # (every 2nd source frame, as with frame_skip=2)
         for pos in arc:
-            fd = FrameDetections(frame_idx=pos.frame_idx)
+            f = pos.frame_idx * 2
+            fd = FrameDetections(frame_idx=f)
             fd.balls.append(Detection(
                 class_name="sports ball",
                 confidence=0.9,
                 bbox=(pos.x - 10, pos.y - 10, pos.x + 10, pos.y + 10),
-                frame_idx=pos.frame_idx,
+                frame_idx=f,
             ))
             tracker.update(fd)
 
         # Set hoop observations
-        hoop = _make_hoop_observation(frame_idx=6)
+        hoop = _make_hoop_observation(frame_idx=12)
         tracker.set_hoop_observations([hoop])
 
         shots = tracker.find_shots()
@@ -433,135 +435,6 @@ class TestHoopObservationDataclass:
         assert obs.confidence == 0.85
 
 
-class TestMultiFrameConsensus:
-    """Tests for the multi-frame consensus filter."""
-
-    def test_consensus_blocks_single_spurious_detection(self):
-        """A single ball detection should not start tracking when consensus=3."""
-        config = TrackingConfig(consensus_required=3, consensus_window=5)
-        tracker = BallTracker(config)
-
-        fd = FrameDetections(frame_idx=0)
-        fd.balls.append(Detection(
-            class_name="sports ball", confidence=0.9,
-            bbox=(200, 200, 220, 220), frame_idx=0,
-        ))
-        result = tracker.update(fd)
-        assert result is None
-
-        # Several frames with no ball
-        for i in range(1, 5):
-            fd_empty = FrameDetections(frame_idx=i)
-            result = tracker.update(fd_empty)
-            assert result is None
-
-    def test_consensus_confirms_after_n_frames(self):
-        """Three consistent detections in 5 frames should confirm tracking."""
-        config = TrackingConfig(consensus_required=3, consensus_window=5)
-        tracker = BallTracker(config)
-
-        result = None
-        for i in range(3):
-            fd = FrameDetections(frame_idx=i)
-            fd.balls.append(Detection(
-                class_name="sports ball", confidence=0.8,
-                bbox=(100 + i, 100 + i, 120 + i, 120 + i), frame_idx=i,
-            ))
-            result = tracker.update(fd)
-
-        assert result is not None
-        assert result.predicted is False
-
-    def test_consensus_rejects_spatially_spread_detections(self):
-        """Detections spread beyond max_spread_px should not confirm."""
-        config = TrackingConfig(
-            consensus_required=3, consensus_window=5, consensus_max_spread_px=50,
-        )
-        tracker = BallTracker(config)
-
-        positions = [(100, 100), (300, 100), (200, 300)]
-        for i, (x, y) in enumerate(positions):
-            fd = FrameDetections(frame_idx=i)
-            fd.balls.append(Detection(
-                class_name="sports ball", confidence=0.8,
-                bbox=(x - 10, y - 10, x + 10, y + 10), frame_idx=i,
-            ))
-            result = tracker.update(fd)
-
-        assert result is None
-
-    def test_consensus_rejects_detections_spread_across_too_many_frames(self):
-        """Spatially-consistent but temporally sparse detections must not confirm.
-
-        Three detections at the same location but at frames 0, 100, 200 fall
-        outside the consensus_window, so they should never confirm a track even
-        though their spatial spread is zero.
-        """
-        config = TrackingConfig(
-            consensus_required=3, consensus_window=5, consensus_max_spread_px=50,
-            max_ball_gap_frames=1000,
-        )
-        tracker = BallTracker(config)
-
-        result = None
-        for frame in (0, 100, 200):
-            fd = FrameDetections(frame_idx=frame)
-            fd.balls.append(Detection(
-                class_name="sports ball", confidence=0.9,
-                bbox=(100, 100, 120, 120), frame_idx=frame,
-            ))
-            result = tracker.update(fd)
-
-        assert result is None
-
-    def test_default_consensus_is_three(self):
-        """Consensus is on by default — a single spurious detection can't seed a track."""
-        assert TrackingConfig().consensus_required == 3
-
-    def test_consensus_disabled_with_required_one(self):
-        """With consensus_required=1, the first detection is accepted."""
-        config = TrackingConfig(consensus_required=1)
-        tracker = BallTracker(config)
-
-        fd = FrameDetections(frame_idx=0)
-        fd.balls.append(Detection(
-            class_name="sports ball", confidence=0.9,
-            bbox=(100, 100, 120, 120), frame_idx=0,
-        ))
-        result = tracker.update(fd)
-        assert result is not None
-
-    def test_consensus_resets_after_long_gap(self):
-        """After ball is lost for max_ball_gap_frames, consensus must re-establish."""
-        config = TrackingConfig(
-            consensus_required=3, consensus_window=5, max_ball_gap_frames=5,
-        )
-        tracker = BallTracker(config)
-
-        # Establish tracking
-        for i in range(3):
-            fd = FrameDetections(frame_idx=i)
-            fd.balls.append(Detection(
-                class_name="sports ball", confidence=0.9,
-                bbox=(100, 100, 120, 120), frame_idx=i,
-            ))
-            tracker.update(fd)
-
-        # Gap of 20 frames with no ball — exceeds max_ball_gap_frames
-        for i in range(3, 23):
-            fd = FrameDetections(frame_idx=i)
-            tracker.update(fd)
-
-        # New detection should NOT be immediately accepted
-        fd = FrameDetections(frame_idx=23)
-        fd.balls.append(Detection(
-            class_name="sports ball", confidence=0.9,
-            bbox=(500, 500, 520, 520), frame_idx=23,
-        ))
-        result = tracker.update(fd)
-        assert result is None
-
-
 class TestSparseTrajectories:
     """Arc finding must reason in source frames, not list indices.
 
@@ -696,24 +569,6 @@ class TestHoopSelection:
         assert shots[0].made_via == "ball_in_basket"
 
 
-class TestKalmanReacquire:
-    def test_covariance_reinflated_on_reseed(self):
-        tracker = BallTracker(TrackingConfig(consensus_required=1))
-        import numpy as np
-
-        # Converge the filter a bit
-        for i in range(20):
-            fd = FrameDetections(frame_idx=i)
-            fd.balls.append(Detection(
-                class_name="ball", confidence=0.9, bbox=(100 + i, 100, 120 + i, 120), frame_idx=i,
-            ))
-            tracker.update(fd)
-        assert tracker._kf.P[0, 0] < 10.0
-
-        tracker._seed_filter(500, 500)
-        assert np.allclose(tracker._kf.P, np.eye(4) * 10.0)
-
-
 class TestPeakAboveRimGate:
     """Gate D: with a rim in view, an arc that never rises above it is not a shot."""
 
@@ -757,3 +612,200 @@ class TestPeakAboveRimGate:
         tracker._positions = positions
         tracker.set_hoop_observations([_make_hoop_observation(frame_idx=55)])
         assert len(tracker.find_shots()) == 1
+
+
+def _ball_fd(frame_idx: int, *centers: tuple[int, int], conf: float = 0.8, size: int = 20,
+             players: list[tuple[int, int]] | None = None) -> FrameDetections:
+    """FrameDetections with ball boxes centred at each (x, y), plus optional players."""
+    fd = FrameDetections(frame_idx=frame_idx)
+    h = size // 2
+    for (x, y) in centers:
+        fd.balls.append(Detection("ball", conf, (x - h, y - h, x + h, y + h), frame_idx))
+    for (x, y) in players or []:
+        fd.players.append(Detection("player", 0.9, (x - 30, y - 80, x + 30, y + 80), frame_idx))
+    return fd
+
+
+class TestTrackletLinking:
+    """Offline linking: candidates -> tracklets -> the ball's chain."""
+
+    def _tracker(self, **cfg) -> BallTracker:
+        return BallTracker(TrackingConfig(**cfg), fps=60.0, frame_size=(1280, 720))
+
+    def test_single_stray_detection_forms_no_track(self):
+        tr = self._tracker()
+        tr.update(_ball_fd(0, (100, 100)))
+        for f in range(2, 20, 2):
+            tr.update(_ball_fd(f))
+        tr.build_tracks()
+        assert tr._positions == []
+
+    def test_consecutive_detections_form_one_track(self):
+        tr = self._tracker()
+        for i in range(10):
+            tr.update(_ball_fd(i * 2, (100 + i * 12, 400 - i * 8)))
+        chosen = tr.build_tracks()
+        assert len(chosen) == 1
+        assert len(tr._positions) == 10
+        assert not any(p.predicted for p in tr._positions)
+
+    def test_gap_is_bridged_and_interpolated(self):
+        tr = self._tracker(max_ball_gap_frames=18)
+        for i in range(0, 12):
+            if i in (5, 6, 7):
+                tr.update(_ball_fd(i * 2))  # ball missed for three analysed frames
+            else:
+                tr.update(_ball_fd(i * 2, (100 + i * 10, 300)))
+        tr.build_tracks()
+        frames = [p.frame_idx for p in tr._positions]
+        assert frames == [i * 2 for i in range(12)]
+        assert [p.predicted for p in tr._positions if p.frame_idx in (10, 12, 14)] == [True, True, True]
+
+    def test_far_stray_detection_during_gap_does_not_hijack_track(self):
+        """The old online tracker snapped onto any detection after a short gap."""
+        tr = self._tracker()
+        for i in range(0, 20):
+            f = i * 2
+            if 6 <= i <= 8:
+                tr.update(_ball_fd(f, (1100, 150)))  # a light fixture, 1000 px away
+            else:
+                tr.update(_ball_fd(f, (100 + i * 10, 300)))
+        tr.build_tracks()
+        xs = [p.x for p in tr._positions]
+        assert max(xs) < 400, "track must not jump to the far stray detections"
+        assert len([p for p in tr._positions if p.predicted]) == 3
+
+    def test_static_clutter_loses_to_moving_ball(self):
+        """A motionless 'ball' seen in every frame is clutter; the moving one is the ball."""
+        tr = self._tracker()
+        for i in range(90):  # 3 s at 60 fps, step 2
+            f = i * 2
+            centers = [(900, 120)]  # exit sign, always detected
+            if 20 <= i < 50:
+                centers.append((200 + (i - 20) * 15, 400 - (i - 20) * 6))
+            tr.update(_ball_fd(f, *centers))
+        chosen = tr.build_tracks()
+        assert len(chosen) == 1
+        assert all(p.x < 800 for p in tr._positions)
+        assert len(tr._positions) == 30
+
+    def test_camera_pan_does_not_make_fixture_look_like_motion(self):
+        """During a pan everything shifts; anchored to the players, the sign is still static."""
+        tr = self._tracker()
+        for i in range(90):
+            f = i * 2
+            pan = i * 6  # camera pans 6 px per analysed frame
+            players = [(300 + pan + k * 90, 450) for k in range(6)]
+            centers = [(900 + pan, 120)]
+            if 20 <= i < 50:
+                centers.append((200 + pan + (i - 20) * 15, 400 - (i - 20) * 6))
+            tr.update(_ball_fd(f, *centers, players=players))
+        chosen = tr.build_tracks()
+        assert len(chosen) == 1
+        assert len(tr._positions) == 30
+
+    def test_two_separate_possessions_give_two_segments(self):
+        tr = self._tracker()
+        for i in range(10):
+            tr.update(_ball_fd(i * 2, (100 + i * 10, 300)))
+        for i in range(10):
+            tr.update(_ball_fd(600 + i * 2, (1000 - i * 10, 300)))
+        chosen = tr.build_tracks()
+        assert len(chosen) == 2
+        assert len(tr._segments) == 2
+
+    def test_update_returns_provisional_position_for_preview(self):
+        tr = self._tracker()
+        pos = tr.update(_ball_fd(0, (100, 100), (500, 500)))
+        assert pos is not None and pos.frame_idx == 0
+        assert tr._positions == []  # nothing committed until build_tracks()
+
+
+class TestRimEntry:
+    """A descending ball that vanishes inside the rim footprint is a shot, and
+    a make unless it is re-detected above the rim shortly after."""
+
+    def _arc_into_rim(self, start_frame: int = 100) -> list[BallPosition]:
+        # Rim box (400,200)-(500,230).  Ascend from y=380 to a peak at y=170,
+        # then three descending detections that end at y=205 inside the rim.
+        ys_up = [380, 340, 300, 260, 220, 190, 170]
+        ys_down = [180, 195, 205]
+        pts = []
+        f = start_frame
+        for y in ys_up + ys_down:
+            pts.append(BallPosition(frame_idx=f, x=450, y=y, predicted=False))
+            f += 2
+        return pts
+
+    def test_vanishing_into_rim_is_a_made_shot(self):
+        tracker = BallTracker(TrackingConfig(), fps=60.0, frame_size=(1280, 720))
+        tracker._positions = self._arc_into_rim()
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=112)])
+        shots = tracker.find_shots()
+        assert len(shots) == 1
+        assert shots[0].made is True
+        assert shots[0].made_via == "rim_entry"
+
+    def test_reappearing_above_rim_is_a_rim_out(self):
+        tracker = BallTracker(TrackingConfig(), fps=60.0, frame_size=(1280, 720))
+        pts = self._arc_into_rim()
+        last = pts[-1].frame_idx
+        # Lost in the rim for 30 frames (> max_ball_gap_frames → track break), then
+        # re-detected 0.5 s after vanishing, bouncing up *above* the rim: a rim-out.
+        bounce = [BallPosition(frame_idx=last + 30 + i * 2, x=510 + i * 5, y=150 - i * 10, predicted=False)
+                  for i in range(5)]
+        tracker._positions = pts + bounce
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=112)])
+        shots = tracker.find_shots()
+        assert len(shots) >= 1
+        assert shots[0].made is False
+        assert shots[0].made_via == "rim_out"
+
+    def test_reappearing_below_rim_is_a_make(self):
+        tracker = BallTracker(TrackingConfig(), fps=60.0, frame_size=(1280, 720))
+        pts = self._arc_into_rim()
+        last = pts[-1].frame_idx
+        below = [BallPosition(frame_idx=last + 30 + i * 2, x=455, y=300 + i * 20, predicted=False)
+                 for i in range(5)]
+        tracker._positions = pts + below  # gap of 30 > max_ball_gap_frames → track break
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=112)])
+        shots = tracker.find_shots()
+        assert len(shots) == 1
+        assert shots[0].made is True
+
+    def test_vanishing_away_from_rim_is_not_a_shot(self):
+        tracker = BallTracker(TrackingConfig(), fps=60.0, frame_size=(1280, 720))
+        pts = [BallPosition(frame_idx=100 + i * 2, x=800, y=y, predicted=False)
+               for i, y in enumerate([380, 340, 300, 260, 220, 190, 170, 180, 195, 205])]
+        tracker._positions = pts
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=112)])
+        assert tracker.find_shots() == []
+
+    def test_disabled_flag(self):
+        tracker = BallTracker(TrackingConfig(rim_entry_enabled=False), fps=60.0, frame_size=(1280, 720))
+        tracker._positions = self._arc_into_rim()
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=112)])
+        assert tracker.find_shots() == []
+
+
+class TestCandidateFiltering:
+    def test_border_candidates_are_dropped(self):
+        tr = BallTracker(TrackingConfig(), fps=60.0, frame_size=(1280, 720))
+        for i in range(10):
+            tr.update(_ball_fd(i * 2, (480 + i, 5), (300 + i * 10, 400)))  # fixture at top edge + ball
+        tr.build_tracks()
+        assert all(p.y > 100 for p in tr._positions)
+
+    def test_link_gate_is_capped(self):
+        """A fixture missed for a long gap must not reach across the frame."""
+        tr = BallTracker(TrackingConfig(max_ball_gap_frames=18, max_link_jump_px=160), fps=60.0, frame_size=(1280, 720))
+        # fixture detections, then 16 missing frames, then the ball 430 px below
+        for i in range(5):
+            tr.update(_ball_fd(i * 2, (470, 60)))
+        for f in range(10, 26, 2):
+            tr.update(_ball_fd(f))
+        for i in range(10):
+            tr.update(_ball_fd(26 + i * 2, (470 + i * 8, 490)))
+        chosen = tr.build_tracks()
+        assert all(len(set(round(p.y / 100) for p in t.positions)) == 1 for t in chosen), \
+            "fixture and ball must be separate tracklets"

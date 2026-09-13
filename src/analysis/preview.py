@@ -50,6 +50,8 @@ EVENT_TIMELINE_COLORS: dict[str, tuple[int, int, int]] = {
 EVENT_TIMELINE_DEFAULT_COLOR = (200, 200, 200)  # fallback gray
 
 MAX_DISPLAY_WIDTH = 1280
+TRAIL_MAX_GAP_FRAMES = 10  # don't connect trail points across a lost-ball gap
+TRAIL_MAX_JUMP_PX = 300  # ...or across a jump larger than this (analysis px)
 
 
 def _scale_frame(frame: np.ndarray) -> tuple[np.ndarray, float]:
@@ -149,7 +151,7 @@ class FramePreview:
             label = f"ball {det.confidence:.0%}"
             _draw_bbox(canvas, det.bbox, COLOR_BALL, label=label, scale=scale)
 
-        # Draw Kalman-filtered ball position and trail
+        # Draw provisional ball position and trail
         if ball_position is not None:
             self._trail.append((ball_position.x, ball_position.y))
             bx, by = int(ball_position.x * scale), int(ball_position.y * scale)
@@ -273,16 +275,24 @@ class ClipReview:
                 if len(pts) > 1:
                     cv2.polylines(canvas, [np.array(pts, dtype=np.int32)], False, color, 2)
 
-        # Draw ball trail (last 30 positions leading up to current frame)
+        # Draw ball trail (last 30 positions leading up to current frame).
+        # Break the polyline at track breaks — a gap in frames or a jump the
+        # tracker could not have followed — so the overlay shows the track,
+        # not a line across the gym between two unrelated detections.
         recent_ball = [
             bp for bp in ball_positions
             if bp.frame_idx <= frame_idx and bp.frame_idx > frame_idx - 30
         ]
         for i in range(1, len(recent_ball)):
+            a, b = recent_ball[i - 1], recent_ball[i]
+            if b.frame_idx - a.frame_idx > TRAIL_MAX_GAP_FRAMES:
+                continue
+            if abs(b.x - a.x) + abs(b.y - a.y) > TRAIL_MAX_JUMP_PX:
+                continue
             alpha = i / len(recent_ball)
             color = tuple(int(c * alpha) for c in COLOR_BALL)
-            p1 = (int(recent_ball[i - 1].x * coord_scale), int(recent_ball[i - 1].y * coord_scale))
-            p2 = (int(recent_ball[i].x * coord_scale), int(recent_ball[i].y * coord_scale))
+            p1 = (int(a.x * coord_scale), int(a.y * coord_scale))
+            p2 = (int(b.x * coord_scale), int(b.y * coord_scale))
             cv2.line(canvas, p1, p2, color, 2)
 
         # Draw current ball position
