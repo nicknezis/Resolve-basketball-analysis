@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from src.analysis.video_analyzer import analyze_timeline, analyze_video, save_results
-from src.config import AnalysisConfig, AudioConfig, EventConfig, TrackingConfig, VideoConfig
+from src.config import AnalysisConfig, AudioConfig, CourtConfig, EventConfig, TrackingConfig, VideoConfig
 
 
 def _parse_clip_indices(clip_str: str) -> list[int]:
@@ -208,6 +208,27 @@ def main(argv: list[str] | None = None) -> int:
         help="Compute device (default: auto)",
     )
     parser.add_argument(
+        "--court-preset",
+        choices=["off", "nfhs", "nba", "fiba"],
+        default="off",
+        help="Experimental: enable court keypoints + homography with these dimensions "
+        "(nfhs = US high school, nba, fiba) for shot zones / 3-pt calls, bench filtering "
+        "and a court overlay in review exports. Default: off.",
+    )
+    parser.add_argument(
+        "--court-model",
+        default="basketball-court-detection-2/22",
+        metavar="MODEL_ID",
+        help="Roboflow court keypoint model (default: basketball-court-detection-2/22)",
+    )
+    parser.add_argument(
+        "--court-every",
+        type=float,
+        default=3.0,
+        metavar="SEC",
+        help="Seconds between court keypoint detections (default: 3.0)",
+    )
+    parser.add_argument(
         "--no-players",
         action="store_true",
         help="Disable player detection and tracking (faster analysis)",
@@ -338,6 +359,12 @@ def main(argv: list[str] | None = None) -> int:
         events=EventConfig(
             min_confidence=args.min_confidence,
             min_video_confidence=args.min_video_confidence,
+        ),
+        court=CourtConfig(
+            enabled=args.court_preset != "off" and not args.no_players,
+            preset=args.court_preset if args.court_preset != "off" else "nfhs",
+            model_id=args.court_model,
+            every_sec=args.court_every,
         ),
         device=args.device,
         preview=args.preview,

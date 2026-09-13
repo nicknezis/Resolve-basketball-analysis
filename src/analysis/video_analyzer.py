@@ -15,11 +15,15 @@ import tempfile
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from src.analysis.color import FrameLUT
 from src.analysis.audio_analyzer import (
     analyze_audio,
     analyze_crowd_excitement,
+    crowd_band_energy,
+    crowd_norm_from_energies,
+    detect_rim_impacts,
     detect_whistles,
     extract_audio,
 )
@@ -28,6 +32,8 @@ from src.analysis.event_classifier import EventClassifier, GameEvent
 from src.analysis.object_detector import ObjectDetector
 from src.analysis.player_tracker import PlayerTracker
 from src.analysis.preview import ClipReview, FramePreview
+from src.analysis.rim_roi import RimRoiRedetector, RimWindow
+from src.analysis.court import CourtModel, CourtTracker, load_court_model
 from src.analysis.scene_detector import Scene, detect_scenes
 from src.config import AnalysisConfig
 
@@ -70,7 +76,7 @@ def analyze_video(
     )
 
     scenes, audio_events, game_events, shot_events, all_detections, \
-        player_tracker, ball_tracker = _run_pipeline(video_path, fps, total_frames, config)
+        player_tracker, ball_tracker, court = _run_pipeline(video_path, fps, total_frames, config)
 
     # Post-analysis review
     review_kwargs = dict(
@@ -81,6 +87,8 @@ def analyze_video(
         shot_events=shot_events,
         game_events=game_events,
         player_tracks=player_tracker.get_tracked_players() if player_tracker else {},
+        frame_tracks=player_tracker.get_frame_tracks() if player_tracker else {},
+        court=court if (court is not None and court.available and config.court.overlay) else None,
         ball_positions=ball_tracker._positions,
         fps=fps,
         input_lut=config.video.input_lut,
@@ -182,6 +190,29 @@ def analyze_timeline(
     clips_analyzed = 0
     clips_skipped = 0
 
+    # Audio pre-pass: extract every clip's audio once and derive game-wide
+    # crowd-energy bounds, so "loud" means loud for this game rather than
+    # for this clip (per-clip min-max made the loudest 2 s of every clip 1.0).
+    audio_cache: dict[int, Path] = {}
+    crowd_norm: tuple[float, float] | None = None
+    if config.audio.crowd_norm == "game":
+        energies = []
+        for clip_global_idx, (_track_idx, clip) in clips_to_process:
+            wav = _extract_clip_audio(clip, tl_fps, config)
+            if wav is None:
+                continue
+            audio_cache[clip_global_idx] = wav
+            try:
+                energies.append(crowd_band_energy(wav, config.audio)[0])
+            except Exception as e:  # noqa: BLE001
+                logger.warning("  Crowd energy pre-pass failed for clip %d: %s", clip_global_idx, e)
+        crowd_norm = crowd_norm_from_energies(energies, config.audio)
+        if crowd_norm:
+            logger.info(
+                "Game-wide crowd normalisation from %d clips: %.1f dB -> 0, %.1f dB -> 1",
+                len(energies), crowd_norm[0], crowd_norm[1],
+            )
+
     for clip_global_idx, (track_idx, clip) in clips_to_process:
         clip_name = clip.get("clip_name", "unknown")
         analysis_path = clip.get("analysis_path", "") or clip.get("file_path", "")
@@ -204,6 +235,8 @@ def analyze_timeline(
             timeline_fps=tl_fps,
             config=config,
             clip_index=clip_global_idx,
+            audio_wav=audio_cache.pop(clip_global_idx, None),
+            crowd_norm=crowd_norm,
         )
 
         all_events.extend(clip_events)
@@ -222,6 +255,9 @@ def analyze_timeline(
             clip_path = clips_dir / f"clip_{clip_global_idx}.json"
             save_results(clip_output, clip_path)
             logger.info("Per-clip results saved to %s", clip_path)
+
+    for wav in audio_cache.values():
+        wav.unlink(missing_ok=True)
 
     # Sort all events by timeline position
     all_events.sort(key=lambda e: e.start_sec)
@@ -246,6 +282,8 @@ def _analyze_clip(
     timeline_fps: float,
     config: AnalysisConfig,
     clip_index: int = 0,
+    audio_wav: Path | None = None,
+    crowd_norm: tuple[float, float] | None = None,
 ) -> tuple[list[GameEvent], list[Scene]]:
     """Analyze a single clip's source range and map results to timeline frames.
 
@@ -254,6 +292,8 @@ def _analyze_clip(
         timeline_fps: The timeline's frame rate.
         config: Analysis settings.
         clip_index: Global clip index (used for review export filenames).
+        audio_wav: Pre-extracted, source-range-trimmed WAV (deleted after use).
+        crowd_norm: Game-wide crowd-energy bounds from the audio pre-pass.
 
     Returns:
         Tuple of (events mapped to timeline frames, scenes mapped to timeline).
@@ -273,7 +313,13 @@ def _analyze_clip(
     lut = FrameLUT(config.video.input_lut)
     detector = ObjectDetector(config.video, device=config.device, detect_players=config.tracking.enable_player_tracking)
     ball_tracker = BallTracker(config.tracking, fps=media_fps)
-    player_tracker = PlayerTracker(config.tracking, device=config.device) if config.tracking.enable_player_tracking else None
+    player_tracker = (
+        PlayerTracker(config.tracking, device=config.device, fps=media_fps / config.video.frame_skip)
+        if config.tracking.enable_player_tracking else None
+    )
+
+    court = _court_tracker_for(config)
+    court_every = max(1, int(round(config.court.every_sec * media_fps)))
 
     cap = cv2.VideoCapture(str(analysis_path))
     if not cap.isOpened():
@@ -307,6 +353,8 @@ def _analyze_clip(
 
             fd = detector.detect_frame(frame_resized, frame_idx)
             all_detections.append(fd)
+            if court is not None and relative_frame % court_every == 0:
+                court.observe(frame_resized, frame_idx)
 
             # Incremental ball tracking
             ball_pos = ball_tracker.update(fd)
@@ -342,59 +390,46 @@ def _analyze_clip(
     if frame_preview is not None:
         frame_preview.close()
 
-    if player_tracker:
-        player_tracker.classify_teams()
-
     # Shot detection using incrementally collected data
     _log_hoop_coverage(hoop_observations, len(all_detections), detector.hoop_capable)
     ball_tracker.set_hoop_observations(hoop_observations)
     shot_events = ball_tracker.find_shots()
+    shot_events = _rim_roi_refine(
+        analysis_path, detector, lut, config, ball_tracker, hoop_observations,
+        all_detections, shot_events, media_fps,
+    )
+    _finish_court(court, ball_tracker, player_tracker, shot_events, config)
+    if player_tracker:
+        player_tracker.classify_teams()
 
     # --- Audio analysis on the source range ---
     audio_events = []
-    try:
-        audio_path = extract_audio(analysis_path, sample_rate=config.audio.sample_rate)
+    trimmed_path = audio_wav if audio_wav is not None else _extract_clip_audio(clip_info, timeline_fps, config)
+    if trimmed_path is not None:
         try:
-            import librosa
-            import soundfile as sf
+            crowd_events = analyze_crowd_excitement(trimmed_path, config.audio, norm=crowd_norm)
+            whistle_events = detect_whistles(trimmed_path, config.audio)
+            impact_events = detect_rim_impacts(trimmed_path, config.audio)
+            audio_events = crowd_events + whistle_events + impact_events
+            audio_events.sort(key=lambda e: e.start_sec)
 
-            y, sr = librosa.load(str(audio_path), sr=config.audio.sample_rate)
-            start_sample = int((source_start / media_fps) * sr)
-            end_sample = int((source_end / media_fps) * sr)
-            y_clip = y[start_sample:end_sample]
-
-            trimmed_path = Path(tempfile.mktemp(suffix=".wav"))
-            sf.write(str(trimmed_path), y_clip, sr)
-
-            try:
-                crowd_events = analyze_crowd_excitement(trimmed_path, config.audio)
-                whistle_events = detect_whistles(trimmed_path, config.audio)
-                audio_events = crowd_events + whistle_events
-                audio_events.sort(key=lambda e: e.start_sec)
-
-                # Shift audio timestamps from clip-relative (0-based from
-                # the trimmed WAV) to source-relative so they align with
-                # shot event frame numbers for audio-video correlation.
-                audio_offset_sec = source_start / media_fps
-                for ae in audio_events:
-                    ae.start_sec += audio_offset_sec
-                    ae.end_sec += audio_offset_sec
-            finally:
-                trimmed_path.unlink(missing_ok=True)
+            # Shift audio timestamps from clip-relative (0-based from the
+            # trimmed WAV) to source-relative so they align with shot event
+            # frame numbers for audio-video correlation.
+            audio_offset_sec = source_start / media_fps
+            for ae in audio_events:
+                ae.start_sec += audio_offset_sec
+                ae.end_sec += audio_offset_sec
+        except Exception as e:  # noqa: BLE001
+            logger.warning("  Audio analysis failed for clip: %s", e)
         finally:
-            audio_path.unlink(missing_ok=True)
-    except Exception as e:
-        logger.warning("  Audio analysis failed for clip: %s", e)
+            trimmed_path.unlink(missing_ok=True)
 
     # --- Scene detection on the source range ---
     scenes = []
     try:
-        all_scenes = detect_scenes(analysis_path, config.scene)
-        scenes = [
-            s for s in all_scenes
-            if s.start_frame >= source_start and s.start_frame < source_end
-        ]
-    except Exception as e:
+        scenes = detect_scenes(analysis_path, config.scene, start_frame=source_start, end_frame=source_end)
+    except Exception as e:  # noqa: BLE001
         logger.warning("  Scene detection failed for clip: %s", e)
 
     # --- Event classification ---
@@ -410,6 +445,8 @@ def _analyze_clip(
         shot_events=shot_events,
         game_events=game_events,
         player_tracks=player_tracker.get_tracked_players() if player_tracker else {},
+        frame_tracks=player_tracker.get_frame_tracks() if player_tracker else {},
+        court=court if (court is not None and court.available and config.court.overlay) else None,
         ball_positions=ball_tracker._positions,
         fps=media_fps,
         input_lut=config.video.input_lut,
@@ -460,6 +497,34 @@ def _analyze_clip(
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def _extract_clip_audio(clip_info: dict, timeline_fps: float, config: AnalysisConfig) -> Path | None:
+    """Extract the clip's audio and trim it to the source range. Returns a temp WAV."""
+    analysis_path = Path(clip_info.get("analysis_path") or clip_info["file_path"])
+    source_start = clip_info["source_start_frame"]
+    source_end = clip_info["source_end_frame"]
+    media_fps = clip_info.get("media_fps", timeline_fps)
+    try:
+        audio_path = extract_audio(analysis_path, sample_rate=config.audio.sample_rate)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("  Audio extraction failed for %s: %s", analysis_path.name, e)
+        return None
+    try:
+        import librosa
+        import soundfile as sf
+
+        y, sr = librosa.load(str(audio_path), sr=config.audio.sample_rate)
+        start_sample = int((source_start / media_fps) * sr)
+        end_sample = int((source_end / media_fps) * sr)
+        trimmed_path = Path(tempfile.mktemp(suffix=".wav"))
+        sf.write(str(trimmed_path), y[start_sample:end_sample], sr)
+        return trimmed_path
+    except Exception as e:  # noqa: BLE001
+        logger.warning("  Audio trim failed for %s: %s", analysis_path.name, e)
+        return None
+    finally:
+        audio_path.unlink(missing_ok=True)
+
+
 def _downscale(frame, max_resolution: int):
     """Shrink a frame so its long edge is at most ``max_resolution`` px."""
     h, w = frame.shape[:2]
@@ -467,6 +532,151 @@ def _downscale(frame, max_resolution: int):
         scale = max_resolution / max(h, w)
         return cv2.resize(frame, (int(w * scale), int(h * scale)))
     return frame
+
+
+def _rim_roi_refine(
+    video_path: Path,
+    detector: ObjectDetector,
+    lut: FrameLUT,
+    config: AnalysisConfig,
+    ball_tracker: BallTracker,
+    hoop_observations: list[HoopObservation],
+    all_detections: list,
+    shot_events: list,
+    fps: float,
+) -> list:
+    """Re-detect the ball at full frame rate around the rim for each shot, then re-run shot detection.
+
+    Extra ball/hoop boxes from the crop pass are merged into the tracker and
+    the detection list (so the review overlay shows them), the hoop
+    observation list is densified, and the arcs are re-evaluated with the
+    richer trajectory.
+    """
+    tcfg = config.tracking
+    if not tcfg.rim_roi_redetect or not shot_events:
+        return shot_events
+    windows = []
+    for sh in shot_events:
+        rim = sh.hoop_bbox
+        if rim is None:
+            continue
+        start = int((sh.peak_frame if sh.peak_frame is not None else sh.start_frame) - tcfg.rim_roi_pre_sec * fps)
+        end = int(sh.end_frame + tcfg.rim_roi_post_sec * fps) + 1
+        windows.append(RimWindow(start_frame=max(0, start), end_frame=end, rim_bbox=rim))
+    if not windows:
+        return shot_events
+
+    extra = RimRoiRedetector(detector, lut, config.video.max_resolution, tcfg).run(video_path, windows)
+    if not extra:
+        return shot_events
+
+    by_idx = {fd.frame_idx: fd for fd in all_detections}
+    for fd in extra:
+        if fd.hoops:
+            best = max(fd.hoops, key=lambda d: d.confidence)
+            hoop_observations.append(HoopObservation(
+                frame_idx=fd.frame_idx, bbox=best.bbox, center=best.center, confidence=best.confidence,
+            ))
+        existing = by_idx.get(fd.frame_idx)
+        if existing is None:
+            all_detections.append(fd)
+            by_idx[fd.frame_idx] = fd
+        else:
+            existing.balls.extend(fd.balls)
+            existing.balls_in_basket.extend(fd.balls_in_basket)
+            if not existing.hoops:
+                existing.hoops.extend(fd.hoops)
+    all_detections.sort(key=lambda fd: fd.frame_idx)
+    hoop_observations.sort(key=lambda o: o.frame_idx)
+
+    ball_tracker.add_frames(extra)
+    ball_tracker.set_hoop_observations(hoop_observations)
+    refined = ball_tracker.find_shots()
+    logger.info("  Shots after rim ROI pass: %d (was %d)", len(refined), len(shot_events))
+    return refined
+
+
+def _court_tracker_for(config: AnalysisConfig) -> CourtTracker | None:
+    """Build the court tracker (keypoint model + preset), or None if disabled/unavailable."""
+    if not config.court.enabled:
+        return None
+    try:
+        model = load_court_model(config.court.model_id)
+        return CourtTracker(CourtModel(config.court.preset), config.court, model=model)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Court detection disabled: %s", exc)
+        return None
+
+
+def _finish_court(
+    court: CourtTracker | None,
+    ball_tracker: BallTracker,
+    player_tracker: PlayerTracker | None,
+    shot_events: list,
+    config: AnalysisConfig,
+) -> None:
+    """Use the court homography to flag off-court people and place each shot's release point."""
+    if court is None or not court.available:
+        if court is not None:
+            logger.warning("  Court keypoints never fitted a homography in this clip")
+        return
+    court.shift_at = ball_tracker.camera_shift_at
+    ccfg = config.court
+    logger.info("  Court homography: %d keyframes, mean reproj %.1f px, mean landmark spread %.2f",
+                len(court.keyframes), float(np.mean([k.reproj_px for k in court.keyframes])),
+                float(np.mean([k.spread for k in court.keyframes])))
+
+    frame_tracks = player_tracker.get_frame_tracks() if player_tracker else {}
+    tracks = player_tracker.get_tracked_players() if player_tracker else {}
+
+    # Off-court people: majority vote over sampled foot points
+    votes: dict[int, list[bool]] = {}
+    for frame_idx, entries in frame_tracks.items():
+        for tid, (x1, y1, x2, y2) in entries:
+            pt = court.to_court(np.array([[(x1 + x2) / 2.0, float(y2)]]), frame_idx)
+            if pt is None or np.isnan(pt[0][0]):
+                continue  # not inside the calibrated area of any keyframe: unknown, not off
+            votes.setdefault(tid, []).append(court.court.on_court(pt[0][0], pt[0][1], ccfg.court_margin_cm))
+    off = 0
+    for tid, v in votes.items():
+        if tid in tracks and len(v) >= 3:
+            tracks[tid].on_court = sum(v) / len(v) >= 0.5
+            off += tracks[tid].on_court is False
+    if votes:
+        logger.info("  Court filter: %d of %d tracked people (in the calibrated area) are off the court", off, len(votes))
+    zoned = 0
+
+    # Shooter and release position per shot
+    for sh in shot_events:
+        if not sh.ball_positions:
+            continue
+        release = sh.ball_positions[0]
+        best, best_d = None, float("inf")
+        for f in range(release.frame_idx - 6, release.frame_idx + 7):
+            for tid, (x1, y1, x2, y2) in frame_tracks.get(f, []):
+                if tracks.get(tid) is not None and tracks[tid].on_court is False:
+                    continue
+                w = max(1, x2 - x1)
+                inside = (x1 - 0.3 * w) <= release.x <= (x2 + 0.3 * w) and (y1 - 0.5 * w) <= release.y <= y2
+                d = 0.0 if inside else min(abs(release.x - x1), abs(release.x - x2)) / w + abs(f - release.frame_idx) * 0.05
+                if d < best_d:
+                    best, best_d = (tid, f, (x1, y1, x2, y2)), d
+        if best is None or best_d > 1.5:
+            continue
+        tid, f, (x1, y1, x2, y2) = best
+        pt = court.to_court(np.array([[(x1 + x2) / 2.0, float(y2)]]), f)
+        if pt is None or np.isnan(pt[0][0]):
+            continue  # shooter stands outside the calibrated area: zone unknown
+        cx, cy = float(pt[0][0]), float(pt[0][1])
+        if not court.court.on_court(cx, cy, ccfg.court_margin_cm * 2):
+            continue
+        sh.shooter_track_id = tid
+        sh.zone = court.court.zone(cx, cy, ccfg.three_point_margin_cm)
+        sh.distance_ft = court.court.distance_cm(cx, cy) / 30.48
+        sh.shot_type = "three" if sh.zone == "three" else ("layup" if sh.distance_ft <= ccfg.layup_max_ft else "jumper")
+        zoned += 1
+    if shot_events:
+        logger.info("  Court zones assigned for %d of %d shots", zoned, len(shot_events))
 
 
 def _log_hoop_coverage(
@@ -635,7 +845,7 @@ def _count_events(events: list[GameEvent]) -> dict[str, int]:
 
 def _run_pipeline(
     video_path: Path, fps: float, total_frames: int, config: AnalysisConfig,
-) -> tuple[list[Scene], list, list[GameEvent], list, list, PlayerTracker, BallTracker]:
+) -> tuple[list[Scene], list, list[GameEvent], list, list, PlayerTracker, BallTracker, CourtTracker | None]:
     """Run the full analysis pipeline on a single video (all frames).
 
     Returns (scenes, audio_events, game_events, shot_events,
@@ -650,9 +860,14 @@ def _run_pipeline(
     logger.info("=== Phase 3: Object Detection + Tracking ===")
     detector = ObjectDetector(config.video, device=config.device, detect_players=config.tracking.enable_player_tracking)
     ball_tracker = BallTracker(config.tracking, fps=fps)
-    player_tracker = PlayerTracker(config.tracking, device=config.device) if config.tracking.enable_player_tracking else None
+    player_tracker = (
+        PlayerTracker(config.tracking, device=config.device, fps=fps / config.video.frame_skip)
+        if config.tracking.enable_player_tracking else None
+    )
 
     lut = FrameLUT(config.video.input_lut)
+    court = _court_tracker_for(config)
+    court_every = max(1, int(round(config.court.every_sec * fps)))
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -678,6 +893,8 @@ def _run_pipeline(
 
             fd = detector.detect_frame(frame_resized, frame_idx)
             all_detections.append(fd)
+            if court is not None and frame_idx % court_every == 0:
+                court.observe(frame_resized, frame_idx)
 
             # Incremental ball tracking
             ball_pos = ball_tracker.update(fd)
@@ -712,17 +929,21 @@ def _run_pipeline(
     if frame_preview is not None:
         frame_preview.close()
 
-    if player_tracker:
-        player_tracker.classify_teams()
-
     logger.info("=== Phase 4: Shot Detection ===")
     _log_hoop_coverage(hoop_observations, len(all_detections), detector.hoop_capable)
     ball_tracker.set_hoop_observations(hoop_observations)
     shot_events = ball_tracker.find_shots()
+    shot_events = _rim_roi_refine(
+        video_path, detector, lut, config, ball_tracker, hoop_observations,
+        all_detections, shot_events, fps,
+    )
+    _finish_court(court, ball_tracker, player_tracker, shot_events, config)
+    if player_tracker:
+        player_tracker.classify_teams()
 
     logger.info("=== Phase 5: Event Classification ===")
     classifier = EventClassifier(config.events, fps=fps)
     game_events = classifier.classify(shot_events, audio_events, scenes)
 
     return scenes, audio_events, game_events, shot_events, all_detections, \
-        player_tracker, ball_tracker
+        player_tracker, ball_tracker, court

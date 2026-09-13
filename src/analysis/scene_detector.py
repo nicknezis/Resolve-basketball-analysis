@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from scenedetect import ContentDetector, SceneManager, open_video
+from scenedetect import ContentDetector, FrameTimecode, SceneManager, open_video
 
 from src.config import SceneConfig
 
@@ -23,8 +23,13 @@ class Scene:
     end_sec: float
 
 
-def detect_scenes(video_path: Path, config: SceneConfig | None = None) -> list[Scene]:
-    """Detect shot/scene boundaries in a video file.
+def detect_scenes(
+    video_path: Path,
+    config: SceneConfig | None = None,
+    start_frame: int | None = None,
+    end_frame: int | None = None,
+) -> list[Scene]:
+    """Detect shot/scene boundaries in a video file (or a frame range of it).
 
     Uses PySceneDetect's ContentDetector which compares frame-to-frame
     changes in HSV color space with an adaptive threshold.
@@ -32,6 +37,8 @@ def detect_scenes(video_path: Path, config: SceneConfig | None = None) -> list[S
     Args:
         video_path: Path to the video file.
         config: Scene detection settings. Uses defaults if None.
+        start_frame, end_frame: Restrict detection to this source range
+            (a timeline clip usually uses a slice of a longer recording).
 
     Returns:
         List of Scene objects with frame and time boundaries.
@@ -51,7 +58,10 @@ def detect_scenes(video_path: Path, config: SceneConfig | None = None) -> list[S
         )
     )
 
-    scene_manager.detect_scenes(video, show_progress=True)
+    if start_frame:
+        video.seek(FrameTimecode(int(start_frame), fps))
+    end_tc = FrameTimecode(int(end_frame), fps) if end_frame else None
+    scene_manager.detect_scenes(video, end_time=end_tc, show_progress=False)
     scene_list = scene_manager.get_scene_list()
 
     scenes = []

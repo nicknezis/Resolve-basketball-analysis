@@ -116,12 +116,26 @@ class EventClassifier:
         if shot.descent_ratio is not None and shot.descent_ratio > 0.7:
             video_conf += 0.05
 
+        # A rim/backboard impact transient at the moment the ball reaches the
+        # rim corroborates a shot.  Weak evidence: gym audio is full of
+        # dribbles and squeaks, so it only nudges the confidence.
+        impact = None
+        if shot.rim_frame is not None:
+            impact = self._find_rim_impact(shot.rim_frame / self.fps, audio_events)
+            if impact is not None:
+                video_conf += 0.03
+
         video_conf = min(1.0, video_conf)
 
         # Check for corroborating audio
         audio_conf = self._find_audio_correlation(start_sec, end_sec, audio_events)
 
-        event_type = "made_shot" if shot.made else "shot_attempt"
+        if shot.made and shot.zone == "three":
+            event_type = "three_pointer"
+        elif shot.made:
+            event_type = "made_shot"
+        else:
+            event_type = "shot_attempt"
 
         # Audio boosts but never gates
         fused = video_conf + self.config.audio_weight * audio_conf * (1.0 - video_conf)
@@ -137,6 +151,18 @@ class EventClassifier:
             details["hoop_position"] = [shot.hoop_x, shot.hoop_y]
         if shot.hoop_x_distance is not None:
             details["hoop_x_distance"] = round(shot.hoop_x_distance, 1)
+        if shot.speed_ratio is not None:
+            details["speed_ratio"] = round(shot.speed_ratio, 2)
+        if shot.fit_rmse is not None:
+            details["fit_rmse"] = round(shot.fit_rmse, 1)
+        if impact is not None:
+            details["rim_impact"] = round(impact, 2)
+        if shot.zone is not None:
+            details["shot_zone"] = shot.zone
+        if shot.distance_ft is not None:
+            details["shot_distance_ft"] = round(shot.distance_ft, 1)
+        if shot.shot_type is not None:
+            details["shot_type"] = shot.shot_type
 
         return GameEvent(
             event_type=event_type,
@@ -149,6 +175,18 @@ class EventClassifier:
             audio_confidence=audio_conf,
             details=details,
         )
+
+    def _find_rim_impact(self, rim_sec: float, audio_events: list[AudioEvent]) -> float | None:
+        """Strongest impact transient within the rim-contact window, or None."""
+        lo, hi = rim_sec - self.config.impact_window_before_sec, rim_sec + self.config.impact_window_after_sec
+        best = None
+        for ae in audio_events:
+            if ae.event_type != "rim_impact":
+                continue
+            if ae.end_sec < lo or ae.start_sec > hi:
+                continue
+            best = ae.score if best is None else max(best, ae.score)
+        return best
 
     def _find_audio_correlation(
         self,

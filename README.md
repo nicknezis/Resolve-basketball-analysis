@@ -31,10 +31,7 @@ source .venv/bin/activate    # macOS / Linux
 pip install -r requirements.txt
 ```
 
-`requirements.txt` pins `setuptools<81` because `deep-sort-realtime` still
-imports `pkg_resources`. The `inference` package declares `setuptools>=83`, so
-`pip check` reports a conflict — it is harmless. Use Python 3.12: newer
-interpreters don't have torch wheels yet.
+Use Python 3.12: newer interpreters don't have torch wheels yet.
 
 You also need **FFmpeg** installed for audio extraction:
 
@@ -111,8 +108,10 @@ The analyzer processes each clip's used portion, running:
 - **YOLO object detection** — finds the basketball, hoop, and players in each frame
 - **Ball tracking** — links every frame's ball candidates into tracklets after the clip is detected, in camera-motion-compensated coordinates, and picks the chain that best explains one ball (stray boxes and static fixtures are rejected)
 - **Shot detection** — validates arcs against multiple gates (duration, descent quality, hoop direction) and determines made vs. miss
-- **Player tracking** — tracks players with DeepSORT, classifies teams by jersey color
-- **Crowd excitement** — analyzes audio mel-spectrograms in the 500–4000 Hz band for roar peaks
+- **Player tracking** — tracks players with ByteTrack, classifies teams by jersey appearance
+- **Court geometry** (experimental, `--court-preset nfhs`) — a court-keypoint model gives an image→court homography (NFHS / NBA / FIBA presets) for shot zones, distances and three-pointer calls; reliable only near the detected landmarks on the reference footage, so it is off by default
+- **Crowd excitement** — analyzes audio mel-spectrograms in the 500–4000 Hz band, normalised across the whole game rather than per clip
+- **Rim impacts** — short 1–6 kHz transients at the moment the ball reaches the rim corroborate a shot
 - **Whistle detection** — finds referee whistles via spectral peaks in the 2000–4500 Hz band
 - **Event classification** — fuses video and audio signals into final events with confidence scores
 
@@ -211,7 +210,13 @@ Detection:
                            `inference` package; requires ROBOFLOW_API_KEY.
   --roboflow-confidence F  Roboflow ball/player confidence threshold (default: 0.4)
   --frame-skip N           Analyze every Nth frame (default: 2)
-  --no-players             Disable player detection and tracking (faster)
+  --no-players             Disable player detection and tracking (faster; also
+                           disables court geometry)
+  --court-preset P         off (default) | nfhs | nba | fiba — experimental court
+                           keypoint homography (zones, 3-pt calls, bench filtering)
+  --court-model ID         Roboflow court keypoint model
+                           (default: basketball-court-detection-2/22)
+  --court-every SEC        Seconds between court keypoint detections (default: 3)
 
 RF-DETR backend (only used with --detector rfdetr; see "Detection Backends"):
   --rfdetr-size SIZE       nano|small|medium|large|xlarge|2xlarge (default: small)
@@ -365,7 +370,7 @@ Video file ──┬──► Scene Detection (PySceneDetect)
              │                                       ├──► Shot Detection
              │                                       │    (arc validation + hoop-directed descent)
              │                                       │
-             ├──► Player Tracking (DeepSORT) ──► Team Classification
+             ├──► Player Tracking (ByteTrack) ──► Team Classification
              │                                   (jersey color k-means)
              │
 Audio track ─┼──► Crowd Excitement Scoring (mel-spectrogram energy)
@@ -414,7 +419,7 @@ Resolve-basketball-analysis/
 │   │   ├── audio_analyzer.py        # Crowd excitement + whistle detection
 │   │   ├── object_detector.py       # YOLO / RF-DETR + Roboflow detection (ball, hoop, players)
 │   │   ├── ball_tracker.py          # Offline tracklet linking + shot detection
-│   │   ├── player_tracker.py        # DeepSORT tracking + team color classification
+│   │   ├── player_tracker.py        # ByteTrack tracking + team classification
 │   │   ├── scene_detector.py        # PySceneDetect wrapper
 │   │   ├── event_classifier.py      # Multi-modal event fusion
 │   │   ├── preview.py               # Live preview + review replay + video export
