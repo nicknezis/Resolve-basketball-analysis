@@ -809,3 +809,118 @@ class TestCandidateFiltering:
         chosen = tr.build_tracks()
         assert all(len(set(round(p.y / 100) for p in t.positions)) == 1 for t in chosen), \
             "fixture and ball must be separate tracklets"
+
+
+class TestFreeFlightGate:
+    """Gate E: a shot must leave every player box for a while; hand-offs never do."""
+
+    def _feed(self, tracker: BallTracker, boxes_by_frame, arc):
+        for pos in arc:
+            fd = FrameDetections(frame_idx=pos.frame_idx)
+            fd.balls.append(Detection("ball", 0.9, (pos.x - 10, pos.y - 10, pos.x + 10, pos.y + 10), pos.frame_idx))
+            for (x1, y1, x2, y2) in boxes_by_frame(pos.frame_idx):
+                fd.players.append(Detection("player", 0.9, (x1, y1, x2, y2), pos.frame_idx))
+            tracker.update(fd)
+
+    def _arc(self):
+        # 20 analysed frames (step 2), rising from y=380 to 100 and back down at x=450
+        pts = []
+        ys = list(range(380, 90, -30)) + list(range(130, 400, 30))
+        for i, y in enumerate(ys):
+            pts.append(BallPosition(frame_idx=i * 2, x=450, y=y, predicted=False))
+        return pts
+
+    def test_hand_off_inside_player_boxes_is_rejected(self):
+        tracker = BallTracker(TrackingConfig(shot_min_arc_height_px=100), fps=60.0, frame_size=(1280, 720))
+        # Two players standing together whose boxes cover the whole ball path
+        self._feed(tracker, lambda f: [(380, 60, 520, 420), (430, 80, 560, 420)], self._arc())
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=20, y1=90, y2=120)])
+        assert tracker.find_shots() == []
+
+    def test_free_flight_passes(self):
+        tracker = BallTracker(TrackingConfig(shot_min_arc_height_px=100), fps=60.0, frame_size=(1280, 720))
+        # Shooter's box covers only the low part of the arc (y > 300)
+        self._feed(tracker, lambda f: [(400, 300, 500, 480)], self._arc())
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=20, y1=90, y2=120)])
+        shots = tracker.find_shots()
+        assert len(shots) == 1
+
+    def test_gate_skipped_without_player_boxes(self):
+        tracker = BallTracker(TrackingConfig(shot_min_arc_height_px=100), fps=60.0, frame_size=(1280, 720))
+        self._feed(tracker, lambda f: [], self._arc())
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=20, y1=90, y2=120)])
+        assert len(tracker.find_shots()) == 1
+
+    def test_gate_can_be_disabled(self):
+        tracker = BallTracker(TrackingConfig(shot_min_arc_height_px=100, require_free_flight=False),
+                              fps=60.0, frame_size=(1280, 720))
+        self._feed(tracker, lambda f: [(380, 60, 520, 420), (430, 80, 560, 420)], self._arc())
+        tracker.set_hoop_observations([_make_hoop_observation(frame_idx=20, y1=90, y2=120)])
+        assert len(tracker.find_shots()) == 1
+
+
+class TestRimPhaseVerdict:
+    """Made/miss from the sequence of rim phases and the post-rim speed."""
+
+    RIM = (400, 200, 500, 230)  # 100 wide, 30 tall
+
+    def _tracker(self, **cfg):
+        tr = BallTracker(TrackingConfig(**cfg), fps=60.0, frame_size=(1280, 720))
+        tr.set_hoop_observations([HoopObservation(frame_idx=30, bbox=self.RIM, center=(450, 215), confidence=0.9)])
+        return tr
+
+    @staticmethod
+    def _projectile(x: int, y0: float, v0: float, g: float, n: int, t_step: int = 1, post_scale=None, start=0):
+        """y(t) = y0 + v0 t + ½ g t² sampled every t_step frames (image coords, +y down)."""
+        pts = []
+        for i in range(n):
+            t = i * t_step
+            y = y0 + v0 * t + 0.5 * g * t * t
+            pts.append(BallPosition(frame_idx=start + t, x=x, y=int(round(y)), predicted=False))
+        return pts
+
+    def test_swish_slowed_by_net_is_made(self):
+        tr = self._tracker()
+        # Flight: launched upward from y=380 at x=450, g=0.5 px/frame², peak y=124 above the rim
+        pts = self._projectile(450, 380, -16.0, 0.5, 70)
+        # Truncate once below the rim bottom, then append slow post-net motion
+        flight = [p for p in pts if p.y <= 245]
+        last = flight[-1]
+        slow = [BallPosition(frame_idx=last.frame_idx + k, x=450, y=last.y + 4 * k, predicted=False) for k in range(1, 6)]
+        tr._positions = flight + slow
+        shots = tr.find_shots()
+        assert len(shots) == 1
+        assert shots[0].made is True and shots[0].made_via == "through_net"
+        assert shots[0].speed_ratio is not None and shots[0].speed_ratio < 0.85
+
+    def test_freefall_through_rim_footprint_is_a_miss(self):
+        """Ball crosses the rim's image footprint at full speed: it was behind/in front of the rim."""
+        tr = self._tracker()
+        pts = self._projectile(450, 380, -16.0, 0.5, 70)
+        tr._positions = pts
+        shots = tr.find_shots()
+        assert len(shots) == 1
+        assert shots[0].made is False and shots[0].made_via == "passed_rim"
+        assert shots[0].speed_ratio is not None and shots[0].speed_ratio > 0.85
+
+    def test_ball_landing_beside_net_is_rim_out(self):
+        tr = self._tracker()
+        pts = self._projectile(450, 380, -16.0, 0.5, 70)
+        flight = [p for p in pts if p.y <= 245]
+        last = flight[-1]
+        # Re-emerges well to the right of the net footprint (rim 400-500 ± 30)
+        aside = [BallPosition(frame_idx=last.frame_idx + k, x=540 + 30 * k, y=last.y + 10 * k, predicted=False)
+                 for k in range(1, 6)]
+        tr._positions = flight + aside
+        shots = tr.find_shots()
+        assert len(shots) == 1
+        assert shots[0].made is False and shots[0].made_via == "rim_out"
+
+    def test_add_frames_merges_and_dedups(self):
+        tr = BallTracker(TrackingConfig(), fps=60.0, frame_size=(1280, 720))
+        tr.update(_ball_fd(0, (100, 100)))
+        tr.update(_ball_fd(2, (110, 100)))
+        extra = [_ball_fd(1, (105, 100)), _ball_fd(2, (112, 101))]  # frame 2 duplicate within 6 px
+        tr.add_frames(extra)
+        assert [f.frame_idx for f in tr._frames] == [0, 1, 2]
+        assert len(tr._frames[2].balls) == 1

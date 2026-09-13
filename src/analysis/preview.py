@@ -34,6 +34,7 @@ COLOR_TEAM_B = (0, 200, 0)       # green
 COLOR_SHOT_MADE = (0, 200, 0)    # green
 COLOR_SHOT_ATTEMPT = (0, 0, 255) # red
 COLOR_HUD_BG = (30, 30, 30)      # dark background for text
+COLOR_COURT = (200, 220, 255)    # light orange: projected court lines
 
 # BGR colors for event types on the timeline bar
 EVENT_TIMELINE_COLORS: dict[str, tuple[int, int, int]] = {
@@ -231,6 +232,9 @@ class ClipReview:
         ball_positions: list[BallPosition],
         ball_lookup: dict[int, BallPosition],
         max_resolution: int = 0,
+        player_tracks: dict | None = None,
+        frame_tracks: dict | None = None,
+        court=None,
     ) -> tuple[np.ndarray, float]:
         """Render all analysis overlays onto a frame. Returns (canvas, scale).
 
@@ -250,6 +254,12 @@ class ClipReview:
         # Maps analysis coords → display coords
         coord_scale = display_scale / analysis_scale
 
+        # Projected court lines (verifies the homography at a glance)
+        if court is not None:
+            for line in court.court_lines(frame_idx):
+                pts = np.round(line * coord_scale).astype(np.int32).reshape(-1, 1, 2)
+                cv2.polylines(canvas, [pts], False, COLOR_COURT, 1, cv2.LINE_AA)
+
         fd = det_lookup.get(frame_idx)
 
         if fd:
@@ -258,9 +268,17 @@ class ClipReview:
                 best_hoop = max(fd.hoops, key=lambda d: d.confidence)
                 _draw_bbox(canvas, best_hoop.bbox, COLOR_HOOP, label="hoop", scale=coord_scale)
 
-            # Draw player bounding boxes
-            for det in fd.players:
-                _draw_bbox(canvas, det.bbox, COLOR_PLAYER, scale=coord_scale)
+            # Draw player boxes: tracked + team-coloured when tracking ran,
+            # raw detections in gray otherwise
+            tracked = (frame_tracks or {}).get(frame_idx)
+            if tracked:
+                for tid, bbox in tracked:
+                    team = player_tracks[tid].team if player_tracks and tid in player_tracks else None
+                    color = COLOR_TEAM_A if team == "team_a" else COLOR_TEAM_B if team == "team_b" else COLOR_PLAYER
+                    _draw_bbox(canvas, bbox, color, scale=coord_scale)
+            else:
+                for det in fd.players:
+                    _draw_bbox(canvas, det.bbox, COLOR_PLAYER, scale=coord_scale)
 
         # Draw shot arc trajectories
         for shot in shot_events:
@@ -305,6 +323,8 @@ class ClipReview:
         for ev in game_events:
             if ev.start_frame <= frame_idx <= ev.end_frame:
                 label = f"{ev.event_type.replace('_', ' ').title()} {ev.confidence:.0%}"
+                if ev.details.get("shot_distance_ft") is not None:
+                    label += f"  {ev.details['shot_distance_ft']:.0f} ft {ev.details.get('shot_zone', '')}"
                 _put_label(canvas, label, 8, y_offset, (255, 255, 255))
                 y_offset += 24
 
@@ -329,6 +349,8 @@ class ClipReview:
         max_resolution: int = 0,
         codec: str = "hevc",
         quality: int | None = None,
+        frame_tracks: dict | None = None,
+        court=None,
     ) -> None:
         """Export the review replay as a video file (no display window).
 
@@ -366,6 +388,7 @@ class ClipReview:
                     det_lookup, shot_events, game_events,
                     ball_positions, ball_lookup,
                     max_resolution=max_resolution,
+                    player_tracks=player_tracks, frame_tracks=frame_tracks, court=court,
                 )
 
                 # HUD (no pause/controls in export)
@@ -442,6 +465,8 @@ class ClipReview:
         fps: float,
         input_lut: Path | None = None,
         max_resolution: int = 0,
+        frame_tracks: dict | None = None,
+        court=None,
     ) -> None:
         """Replay a clip's video with full analysis overlays (interactive window)."""
         try:
@@ -474,6 +499,7 @@ class ClipReview:
                 det_lookup, shot_events, game_events,
                 ball_positions, ball_lookup,
                 max_resolution=max_resolution,
+                player_tracks=player_tracks, frame_tracks=frame_tracks, court=court,
             )
 
             # HUD

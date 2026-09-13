@@ -10,7 +10,7 @@ The engine uses a six-phase pipeline to detect basketball game events from video
 2. **Audio Analysis** -- Extract crowd excitement peaks and referee whistle events from the audio track
 3. **Object Detection** -- Run YOLO inference to locate the basketball, hoop, and players in each frame
 4. **Ball Tracking** -- Link per-frame ball candidates into tracklets offline, pick the ball's chain, detect shot arcs
-5. **Player Tracking** -- Maintain player identity across frames with DeepSORT and classify teams by jersey color
+5. **Player Tracking** -- Maintain player identity across frames with ByteTrack and classify teams by jersey appearance
 6. **Event Classification** -- Fuse video and audio signals into final `GameEvent` objects with confidence scores
 
 Each phase is implemented as an independent module under `src/analysis/`. The pipeline orchestrator (`video_analyzer.py`) chains them together and supports two modes: single-video analysis and timeline-aware multi-clip analysis for DaVinci Resolve integration.
@@ -117,16 +117,31 @@ During arc validation, two quality metrics are computed and stored on each `Shot
 
 These metrics are used downstream by the event classifier to adjust confidence scores.
 
+### Near-Rim Re-Detection
+
+Made/miss is decided in the few frames where the ball meets the rim, which is also where the main pass sees it worst: the ball is small, half-hidden by net and backboard, and the pass only samples every Nth frame. After the first round of shot detection, `rim_roi.RimRoiRedetector` re-reads **every source frame** of each shot window (`rim_roi_pre_sec` before the peak to `rim_roi_post_sec` after the arc end), crops `rim_roi_width_factor` rim widths around the rim (`rim_roi_above_factor` heights above, `rim_roi_below_factor` below, covering the net), upscales the crop by `rim_roi_scale` and runs the same detector. The extra ball/hoop boxes are mapped back, merged into the tracker (`BallTracker.add_frames`) and the detection list (so the review overlay shows them), and shot detection runs again on the denser trajectory. Cost ≈ 1 s of detector time per shot. Disable with `rim_roi_redetect=False`.
+
 ### Made Shot Detection
 
 `ShotEvent.made` is **tri-state**: `True`, `False`, or `None` when no usable hoop observation exists for the shot. "No rim in view" is reported as unknown, never as a miss, and the classifier gives it a lower base confidence.
 
-1. **Rim selection.** Per-frame hoop observations (bbox + centre) are collected during detection. For a given descent, only observations within `hoop_obs_max_age_frames` (default 30) of the descent window are eligible — with a panning camera, a rim seen 20 s earlier says nothing about where the rim is now. When both baskets are in view, the observation horizontally nearest the descent (within two rim-widths) wins, then the one nearest in time. The selected rim also feeds the hoop-directed gate.
-2. **Bbox crossing** (`made_via="bbox"`). The descent must contain a position clearly above the rim top (`hoop_entry_y_margin_px`) followed by a later position at/below it, both within the rim's horizontal extent expanded by `hoop_x_tolerance_ratio`.
-3. **Polygon zone** (`made_via="polygon"`, opt-in via `--polygon-zone`). A trapezoid from the rim box down through the net; a descent position inside it counts as a make. Requires `supervision`.
-4. **Ball-in-basket** (`made_via="ball_in_basket"`). If the detector emits a `ball-in-basket` class (e.g. the Roboflow 10-class basketball model) between the arc peak and the end of the post-arc window, the shot is a make regardless of geometry.
-5. **Rim entry** (`made_via="rim_entry"` / `"rim_out"`). The detector loses the ball as it enters the net, so a make from just above the rim often shows only a few descending pixels before the track ends. If the last *detected* position after a peak lies inside the rim's footprint (horizontal span ± tolerance, from just above the rim top to one rim-height below it) and the track then ends or breaks, the arc is accepted without the descent-ratio gate. Verdict by look-ahead: if the ball is re-detected within `rim_entry_lookahead_sec` *above* the rim bottom it rimmed out (`made=False`, `rim_out`); if it reappears below the rim, or not at all, it went in (`rim_entry`).
-6. **Centre proximity** (`made_via="proximity"`) is the legacy fallback used only when hoop *centres* were supplied without boxes (`set_hoop_positions`): any position within `hoop_proximity_px` of the median centre.
+1. **Rim selection.** Per-frame hoop observations (bbox + centre) are collected during detection. For a given descent, only observations within `hoop_obs_max_age_frames` (default 30) of the descent window are eligible — with a panning camera, a rim seen 20 s earlier says nothing about where the rim is now. When both baskets are in view, the observation horizontally nearest the descent (within two rim-widths) wins, then the one nearest in time. Each position is then judged against the observation of *that* rim nearest in time, so a pan during the flight is followed.
+2. **Rim phases.** Every detected position after the arc peak is classified against the rim box: **approach** (above the rim top by `hoop_entry_y_margin_px`, horizontally within the rim span ± `hoop_x_tolerance_ratio`), **rim** (inside the band from the rim top − margin to the bottom + ½ rim height), **post_net** (below the band, within the rim span ± `net_x_tolerance_ratio`) or **post_off** (below the band but beside the net). The verdict comes from the sequence:
+
+   | Sequence | Verdict | `made_via` |
+   |---|---|---|
+   | approach → post_net, ball slowed below freefall | made | `through_net` |
+   | approach → post_net at freefall speed | miss — it passed in front of / behind the rim | `passed_rim` |
+   | approach → post_off, or rim band then back up | miss | `rim_out` |
+   | approach → rim band, then the track ends | look-ahead (below) | `rim_entry` / `rim_out` |
+   | never approached within the rim span | miss | `short` |
+
+3. **Freefall speed check.** A parabola `y = a·t² + b·t + c` is fitted to the detected flight; it is trusted only if `a > 0` and the residual is under 6% of the flight's vertical span (real flights fit to a few px at 720p). The measured descent speed over the first three `post_net` points is compared with the fitted speed at that time; `speed_ratio` above `post_rim_speed_made_max` (default 0.85) means the net did not slow the ball. Without a trustworthy fit or enough post-rim points the ratio is `None` and the geometric verdict stands.
+4. **Rim entry** (`made_via="rim_entry"` / `"rim_out"`). The detector often loses the ball as it enters the net. If the last *detected* position after a peak lies inside the rim's footprint and the track then ends or breaks, the arc is accepted without the descent-ratio gate. If the ball is re-detected within `rim_entry_lookahead_sec` *above* the rim bottom it rimmed out; if it reappears below the rim, or not at all, it went in.
+5. **Ball-in-basket** (`made_via="ball_in_basket"`). If the detector emits a `ball-in-basket` class between the arc peak and the end of the post-arc window, the shot is a make regardless of geometry.
+6. **Polygon zone** (`--polygon-zone`) and **centre proximity** (`set_hoop_positions`) remain as opt-in / legacy fallbacks.
+
+Each shot carries `speed_ratio`, `fit_rmse`, `rim_impact` (if heard), `shot_zone`, `shot_distance_ft` and `shot_type` in its details for auditing. Made shots from the three zone are emitted as `three_pointer` events.
 
 ---
 
@@ -134,33 +149,43 @@ These metrics are used downstream by the event classifier to adjust confidence s
 
 **Module:** `src/analysis/player_tracker.py`
 
-### DeepSORT Multi-Object Tracking
+### ByteTrack Multi-Object Tracking
 
-Player identity is maintained across frames using `deep-sort-realtime`:
+Player identity is maintained across frames with ByteTrack (`trackers.ByteTrackTracker`, Roboflow's tracker library), which associates boxes by predicted-position IoU only. At 60 fps players move a few pixels between analysed frames, so an appearance embedder adds cost without information — DeepSORT's per-box re-ID network was ~40% of the per-frame budget.
 
-- **Max age:** Tracks are dropped after `deepsort_max_age` (default 30) consecutive frames without a matching detection
-- **N-init:** A track must be confirmed by `deepsort_n_init` (default 3) consecutive detections before it is reported
-- **Embedder GPU:** DeepSORT's appearance embedder uses CUDA if available; MPS is not supported by the library, so on Apple Silicon the embedder always runs on CPU
+- **Activation:** a detection needs `track_activation_threshold` (default 0.5) confidence to start a new track; boxes above `track_high_conf_threshold` (0.6) are matched first, the rest in ByteTrack's second low-confidence pass.
+- **Lost buffer:** tracks survive `track_lost_buffer_frames` (default 30 analysed frames) without a match.
+- **Confirmation:** a track is reported after `track_min_hits` (default 3) consecutive matches.
+- **Matching:** IoU ≥ `track_min_iou` (default 0.1).
 
-Detections are fed to DeepSORT in `[x1, y1, width, height]` format with confidence and class label.
+The tracker receives the same (downscaled) frame the boxes were computed on.
 
-### Jersey Color Sampling
+### Jersey Crops
 
-For each confirmed track in each frame, the dominant jersey color is extracted:
-
-1. Crop the **upper 40%** of the player bounding box (approximates the torso/jersey area)
-2. Convert the crop from BGR to HSV color space
-3. Compute the **median HSV value** across all pixels in the crop
-4. Store the sample; each player accumulates samples over their tracked lifetime
+For every confirmed track, up to `jersey_crops_per_track` torso crops are stored, at most one every `jersey_sample_every_frames` source frames: the central 15–55 % of the box height with 20 % trimmed from each side, so heads, legs and the neighbour's shirt stay out. Tracks with fewer than `jersey_min_crops` crops are never assigned a team.
 
 ### Team Classification
 
-After all frames are processed, players are classified into two teams:
+`team_method="siglip"` (default) embeds every crop with SigLIP (`team_embed_model`, batched on MPS/CUDA — 64 crops in ~0.45 s), averages per track, reduces with PCA and runs k-means (k=2). Tracks farther than mean + `team_outlier_std` × std from both centres stay unassigned — that is where referees' stripes and spectators land, so they are not forced into a team. People the court homography places off the court (see below) are excluded before clustering. `team_method="hsv"` is the previous median-colour k-means and the automatic fallback if the model cannot be loaded. The review export colours tracked boxes by team (blue / green, gray = unassigned).
 
-1. For each player with at least 3 color samples, compute the **median HSV** across all their samples
-2. Stack all player median colors into a matrix
-3. Run **OpenCV k-means** (k=2, up to 100 iterations, epsilon 0.2, 10 random restarts with `KMEANS_PP_CENTERS`)
-4. Assign each player to `"team_a"` or `"team_b"` based on their cluster label
+---
+
+## Court Geometry (experimental, opt-in)
+
+**Module:** `src/analysis/court.py` — enable with `--court-preset nfhs|nba|fiba`.
+
+**Status.** On the reference footage this works on one end of the court and not the other: with the camera looking at the far basket the projected lines sit on the painted lines and shooter zones look right; looking at the near basket the accepted keyframes still produce a mapping that is visibly wrong, and zones assigned to the same shot change between keyframes. The keypoint model returns 14–20 landmarks per frame, but only 6–9 of them agree with the template within 60 cm, so RANSAC picks a small self-consistent subset that may not be the right one. Until a keypoint model trained on this kind of footage exists (or a court-specific calibration), treat zones and distances as hints and leave the feature off for production runs.
+
+A Roboflow court-keypoint model (`CourtConfig.model_id`, default `basketball-court-detection-2/22`, 17 landmarks) runs every `every_sec` seconds of a clip. Keypoints above `keypoint_confidence` are matched by name to a template of 33 court vertices (vendored from roboflow/sports, MIT) computed from a dimension preset — `nfhs` (US high school: 84 ft court, 12 ft key, 19'9" arc that runs straight to the baseline once level with the basket), `nba` or `fiba` — and a RANSAC homography image → court (cm) is fitted; keyframes with fewer than `min_keypoints` inliers, a mean re-projection above `max_reproj_px`, or inliers that don't span an area (`min_spread_ratio`) are discarded. Between keyframes the mapping is carried by the camera-shift estimate from the ball tracker, which is enough for a pan.
+
+A homography fitted to landmarks at one end of the court is only trustworthy *near those landmarks*: on the reference footage the model returns 14–20 keypoints per frame but typically 6–9 agree with the template, and the resulting mappings extrapolate the far corners thousands of pixels off-frame. So every court query is answered only for points inside the keyframe's inlier hull plus `calibrated_buffer_cm`; elsewhere the answer is "unknown" (no zone, no off-court flag), never a guess.
+
+Uses:
+- **Off-court people.** Each tracked person's foot point (bottom-centre of the box) is projected at every frame; a majority outside the lines by more than `court_margin_cm` marks the track `on_court=False` — excluded from team classification and from shooter matching.
+- **Shot zone and distance.** The shooter is the on-court track whose box holds the ball at the start of the shot window; their foot point is projected and classified as `paint`, `two` or `three` (`three_point_margin_cm` tolerance, corner rule respected), with the distance to the basket centre in feet. A made shot from the three zone is emitted as `three_pointer`; `details.shot_type` is `three`, `layup` (≤ `layup_max_ft`) or `jumper`.
+- **Overlay.** Review exports draw the projected court lines (`overlay`), so a wrong homography is obvious at a glance.
+
+Disable with `--court-preset off`; `--no-players` also disables it (no shooter to place).
 
 ---
 
@@ -187,6 +212,14 @@ Detects peaks of crowd noise energy in a specific frequency band.
 6. **Min-max normalize** the energy vector to [0, 1]
 7. Threshold at `excitement_threshold` (default 0.6)
 8. Extract contiguous regions above the threshold as `AudioEvent` objects, with the peak score within each region as the event score
+
+### Rim / Backboard Impact Transients
+
+`detect_rim_impacts()` looks for short broadband bursts: band-limited spectral flux (positive log-magnitude change summed over the 1–6 kHz STFT bins) at 5 ms resolution (`impact_hop_sec`), scored by prominence over a rolling median/MAD baseline (`impact_local_window_sec`) so a loud gym neither hides nor manufactures them; bursts longer than `impact_max_duration_sec` (crowd, whistles) are dropped. Each surviving onset becomes a `rim_impact` audio event with `score` = prominence / (3 × `impact_min_prominence`), capped at 1. The classifier looks for one within `impact_window_before_sec` … `impact_window_after_sec` of the frame the ball first reaches the rim band (`ShotEvent.rim_frame`) and, if found, adds +0.03 video confidence and `details.rim_impact`. On the reference footage the rim contact of a known make produces a clear transient ~0.1 s after the visual contact (sound travel + shutter), but dribbles and shoe squeaks produce about one transient per second too — treat this as weak corroboration, not evidence on its own. A clean swish is too quiet to detect.
+
+### Game-Wide Crowd Normalisation
+
+Crowd energy used to be min-max normalised per clip, which made the loudest two seconds of *every* clip score 1.0. With `crowd_norm="game"` (default) the timeline analysis runs an audio pre-pass over all selected clips first (`crowd_band_energy`, absolute dB), takes the `crowd_norm_low_pct` / `crowd_norm_high_pct` percentiles of all windows as the 0 / 1 anchors (`crowd_norm_from_energies`), and scores every clip against them. The pre-pass extracts each clip's audio once and hands the trimmed WAV to the clip analysis, so nothing is decoded twice.
 
 ### Whistle Detection
 
@@ -277,7 +310,7 @@ Processes one video file through the six-phase pipeline in order:
 2. Audio analysis (extract + crowd excitement + whistle detection)
 3. Object detection (YOLO on every Nth frame, optionally supplemented by Roboflow)
 4. Ball tracking (offline tracklet linking + shot arc detection)
-5. Player tracking (DeepSORT + team classification) — skipped when `--no-players` is set
+5. Player tracking (ByteTrack + team classification) — skipped when `--no-players` is set
 6. Event classification (multi-modal fusion)
 
 Output events use frame numbers and timestamps relative to the video file.
@@ -349,6 +382,14 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `whistle_freq_low_hz` | `int` | `2000` | Lower bound of whistle band (Hz) |
 | `whistle_freq_high_hz` | `int` | `4500` | Upper bound of whistle band (Hz) |
 | `whistle_energy_threshold` | `float` | `0.7` | Whistle onset strength threshold |
+| `crowd_norm` | `str` | `"game"` | `game`: one crowd-energy scale across all clips (audio pre-pass); `clip`: per-clip min/max |
+| `crowd_norm_low_pct` | `float` | `5.0` | Percentile of game-wide band energy that scores 0 |
+| `crowd_norm_high_pct` | `float` | `99.5` | Percentile that scores 1 |
+| `impact_freq_low_hz` / `impact_freq_high_hz` | `int` | `1000` / `6000` | Band for rim/backboard transients |
+| `impact_hop_sec` | `float` | `0.005` | Onset resolution |
+| `impact_min_prominence` | `float` | `10.0` | Onset prominence over the local baseline (MAD units) |
+| `impact_max_duration_sec` | `float` | `0.25` | Longer bursts are not impacts |
+| `impact_local_window_sec` | `float` | `1.5` | Baseline window |
 
 ### TrackingConfig
 
@@ -363,7 +404,7 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `tracklet_size_ratio_max` | `float` | `2.5` | Max size ratio between consecutive linked boxes |
 | `compensate_camera_motion` | `bool` | `True` | Link in rim/player-anchored coordinates |
 | `static_span_px` | `int` | `40` | Tracklets whose compensated extent stays under this… |
-| `static_clutter_sec` | `float` | `1.0` | …for at least this long are discarded as fixtures |
+| `static_clutter_sec` | `float` | `0.5` | …for at least this long are discarded as fixtures |
 | `motion_full_span_px` | `int` | `200` | Compensated extent that earns full motion credit in scoring |
 | `teleport_penalty_per_px` | `float` | `0.05` | Chain penalty per px of implausible jump between tracklets |
 | `shot_min_arc_height_px` | `int` | `50` | Minimum arc height (pixels) for a shot |
@@ -378,13 +419,33 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `shot_min_descent_ratio` | `float` | `0.15` | Ball must descend at least this fraction of ascent height (low for layups) |
 | `shot_max_arc_sec` | `float` | `3.0` | Max duration of a single arc in source seconds |
 | `shot_pre_peak_sec` | `float` | `0.5` | Max time before peak to include in shot event window |
-| `shot_post_arc_sec` | `float` | `0.35` | Extra time past arc_end to check for made shot (backboard bounces) |
+| `shot_post_arc_sec` | `float` | `0.6` | Extra time past arc_end to check for made shot (backboard bounces) |
 | `rim_entry_enabled` | `bool` | `True` | A descending ball that vanishes inside the rim footprint is a shot |
 | `rim_entry_lookahead_sec` | `float` | `0.6` | …and a make unless re-detected above the rim within this time |
+| `rim_roi_redetect` | `bool` | `True` | Second detector pass on rim crops during shot windows |
+| `rim_roi_pre_sec` / `rim_roi_post_sec` | `float` | `0.15` / `1.0` | Window around each shot for the ROI pass |
+| `rim_roi_scale` | `float` | `2.0` | Upscale factor for the rim crop |
+| `rim_roi_width_factor` | `float` | `3.0` | Crop width in rim widths |
+| `rim_roi_above_factor` / `rim_roi_below_factor` | `float` | `1.5` / `3.0` | Crop extent above / below the rim in rim heights |
+| `net_x_tolerance_ratio` | `float` | `0.3` | Post-rim x must stay within the rim span ± this fraction of rim width to count as through the net |
+| `post_rim_speed_made_max` | `float` | `0.85` | Measured/expected freefall speed below the rim above which the ball is judged to have passed the rim |
+| `parabola_min_points` | `int` | `4` | Detected flight points needed for the projectile fit |
 | `use_polygon_zone` | `bool` | `False` | Net-zone made-shot fallback (`--polygon-zone`, needs `supervision`) |
-| `deepsort_max_age` | `int` | `30` | Frames before dropping unmatched track |
-| `deepsort_n_init` | `int` | `3` | Detections needed to confirm a track |
-| `enable_player_tracking` | `bool` | `True` | Set `False` to skip DeepSORT player tracking (`--no-players`) |
+| `require_free_flight` | `bool` | `True` | A shot must leave every player box during the arc |
+| `min_free_flight_sec` | `float` | `0.2` | Minimum unobstructed flight for a shot |
+| `free_flight_box_pad` | `float` | `0.1` | Player-box padding for the containment test |
+| `track_activation_threshold` | `float` | `0.5` | ByteTrack: detection confidence to start a track |
+| `track_high_conf_threshold` | `float` | `0.6` | ByteTrack: high-confidence association split |
+| `track_lost_buffer_frames` | `int` | `30` | ByteTrack: analysed frames a lost track is kept |
+| `track_min_iou` | `float` | `0.1` | ByteTrack: minimum IoU for matching |
+| `track_min_hits` | `int` | `3` | ByteTrack: matches before a track is reported |
+| `jersey_sample_every_frames` | `int` | `20` | Source frames between stored torso crops per track |
+| `jersey_crops_per_track` | `int` | `8` | Crops kept per track for team clustering |
+| `jersey_min_crops` | `int` | `3` | Tracks with fewer crops stay unclassified |
+| `team_method` | `str` | `"siglip"` | `siglip` embeddings + PCA + k-means, or `hsv` |
+| `team_embed_model` | `str` | `"google/siglip-base-patch16-224"` | Embedding model |
+| `team_outlier_std` | `float` | `2.0` | Tracks farther than this from both centres stay unassigned |
+| `enable_player_tracking` | `bool` | `True` | Set `False` to skip player tracking (`--no-players`) |
 
 ### EventConfig
 
@@ -396,6 +457,26 @@ All parameters are defined as dataclasses in `src/config.py`. The top-level `Ana
 | `highlight_pre_pad_sec` | `float` | `3.0` | Seconds before event for highlight clip |
 | `highlight_post_pad_sec` | `float` | `2.0` | Seconds after event for highlight clip |
 | `merge_gap_sec` | `float` | `2.0` | Merge events closer than this (seconds) |
+| `impact_window_before_sec` / `impact_window_after_sec` | `float` | `0.08` / `0.3` | Window around the rim-contact frame for an impact transient |
+
+### CourtConfig
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | `bool` | `False` | Run court keypoints / homography (experimental) |
+| `preset` | `str` | `"nfhs"` | Court dimensions: `nfhs`, `nba`, `fiba` (`--court-preset`) |
+| `model_id` | `str` | `"basketball-court-detection-2/22"` | Roboflow keypoint model (`--court-model`) |
+| `every_sec` | `float` | `3.0` | Seconds between keypoint detections (`--court-every`) |
+| `detection_confidence` / `keypoint_confidence` | `float` | `0.3` / `0.5` | Model and per-keypoint thresholds |
+| `min_keypoints` | `int` | `7` | Inliers needed for a keyframe |
+| `ransac_reproj_cm` / `max_reproj_px` | `float` | `60` / `15` | RANSAC threshold; keyframe rejection threshold |
+| `min_spread_ratio` | `float` | `0.25` | Inlier landmarks must span an area, not a line |
+| `calibrated_buffer_cm` | `float` | `300` | Court questions are only answered within the inlier hull + this |
+| `max_keyframe_age_frames` | `int` | `600` | Don't use a keyframe farther away than this |
+| `court_margin_cm` | `float` | `30` | Beyond the lines by more than this = off court (benches sit ~1 m outside) |
+| `three_point_margin_cm` | `float` | `15` | Tolerance on the arc |
+| `layup_max_ft` | `float` | `5.0` | Release distance below which a shot is a layup |
+| `overlay` | `bool` | `True` | Draw court lines in review exports |
 
 ### SceneConfig
 

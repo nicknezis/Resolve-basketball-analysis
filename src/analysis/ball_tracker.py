@@ -72,8 +72,16 @@ class ShotEvent:
     hoop_bbox: tuple[int, int, int, int] | None = None
     hoop_x_distance: float | None = None  # pixels between descent median x and hoop x
     descent_ratio: float | None = None  # descent_height / arc_height
-    made_via: str | None = None  # "bbox", "polygon", "proximity", "ball_in_basket"
+    made_via: str | None = None  # "through_net", "rim_entry", "rim_out", "passed_rim", "short", ...
     peak_frame: int | None = None
+    speed_ratio: float | None = None  # measured / expected freefall speed just below the rim
+    fit_rmse: float | None = None  # residual of the projectile fit over the flight (px)
+    rim_frame: int | None = None  # source frame where the ball first reaches the rim band
+    # Court context (filled by the analyzer when a court homography is available)
+    zone: str | None = None  # "paint", "two", "three"
+    distance_ft: float | None = None  # release point to basket centre
+    shot_type: str | None = None  # "layup", "jumper", "three"
+    shooter_track_id: int | None = None
 
 
 @dataclass
@@ -95,6 +103,7 @@ class _Frame:
     balls: list[_Candidate]
     player_centers: list[tuple[int, int]]
     hoop_center: tuple[int, int] | None
+    player_boxes: list[tuple[int, int, int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -198,6 +207,7 @@ class BallTracker:
             frame_idx=frame_idx, balls=cands,
             player_centers=[d.center for d in frame_detections.players],
             hoop_center=hoop,
+            player_boxes=[d.bbox for d in frame_detections.players],
         ))
         self._built = False
 
@@ -205,6 +215,47 @@ class BallTracker:
             return None
         best = max(cands, key=lambda c: c.confidence)
         return BallPosition(frame_idx=frame_idx, x=best.x, y=best.y, predicted=False)
+
+    def add_frames(self, extra: list[FrameDetections]) -> None:
+        """Merge extra per-frame detections (e.g. the near-rim ROI pass) into the record.
+
+        Frames already recorded get the new ball/hoop boxes appended; frames
+        that were skipped by ``frame_skip`` are inserted, so the rim area is
+        sampled at full frame rate during shot windows.
+        """
+        by_idx = {f.frame_idx: f for f in self._frames}
+        for fd in extra:
+            cands = [
+                _Candidate(frame_idx=fd.frame_idx, x=d.center[0], y=d.center[1],
+                           size=float(max(1, d.area)) ** 0.5, confidence=d.confidence)
+                for d in fd.balls if not self._touches_border(d.center)
+            ]
+            hoop = max(fd.hoops, key=lambda d: d.confidence).center if fd.hoops else None
+            if fd.balls_in_basket:
+                self._ball_in_basket_frames.append(fd.frame_idx)
+            fr = by_idx.get(fd.frame_idx)
+            if fr is None:
+                fr = _Frame(frame_idx=fd.frame_idx, balls=[], player_centers=[], hoop_center=hoop)
+                by_idx[fd.frame_idx] = fr
+                self._frames.append(fr)
+            else:
+                # The same ball seen by both passes must stay one candidate,
+                # or two parallel tracklets form and the chain drops one of
+                # them.  Keep the higher-confidence box.
+                for c in list(cands):
+                    for e in list(fr.balls):
+                        if abs(c.x - e.x) + abs(c.y - e.y) <= max(12.0, 0.8 * max(c.size, e.size)):
+                            if c.confidence > e.confidence:
+                                fr.balls.remove(e)
+                            else:
+                                cands.remove(c)
+                            break
+                if fr.hoop_center is None:
+                    fr.hoop_center = hoop
+            fr.balls.extend(cands)
+        self._frames.sort(key=lambda f: f.frame_idx)
+        self._ball_in_basket_frames = sorted(set(self._ball_in_basket_frames))
+        self._built = False
 
     def _touches_border(self, center: tuple[int, int]) -> bool:
         """Boxes centred on the frame edge are clipped objects or fixtures, not the ball."""
@@ -293,6 +344,7 @@ class BallTracker:
             return []
 
         cum_shift = self._camera_shifts()
+        self._cum_shift = cum_shift
         tracklets = self._link_tracklets(cum_shift)
         self._score_tracklets(tracklets, cum_shift)
         chosen = self._select_chain(tracklets, cum_shift)
@@ -310,6 +362,20 @@ class BallTracker:
             len(chosen), len(self._positions),
         )
         return chosen
+
+    def camera_shift_at(self, frame_idx: int) -> tuple[float, float]:
+        """Accumulated camera shift (px) at the recorded frame nearest ``frame_idx``."""
+        cum = getattr(self, "_cum_shift", None)
+        if not cum:
+            return (0.0, 0.0)
+        if frame_idx in cum:
+            return cum[frame_idx]
+        keys = sorted(cum)
+        i = int(np.searchsorted(keys, frame_idx))
+        i = min(max(i, 0), len(keys) - 1)
+        if i > 0 and abs(keys[i - 1] - frame_idx) < abs(keys[i] - frame_idx):
+            i -= 1
+        return cum[keys[i]]
 
     def _camera_shifts(self) -> dict[int, tuple[float, float]]:
         """Cumulative image shift per analysed frame due to camera motion.
@@ -408,20 +474,34 @@ class BallTracker:
                 used_t.add(i)
                 used_c.add(j)
             for j, c in enumerate(fr.balls):
-                if j not in used_c:
+                if j in used_c:
+                    continue
+                # A second box a few px from one that was just matched is the
+                # same object seen twice (two detectors, two passes), not a
+                # new track.
+                dup = any(
+                    abs(c.x - fr.balls[k].x) + abs(c.y - fr.balls[k].y) <= max(12.0, 0.8 * c.size)
+                    for k in used_c
+                )
+                if not dup:
                     active.append(Tracklet(dets=[c]))
 
         finished.extend(active)
         return [t for t in finished if len(t.dets) >= cfg.min_tracklet_detections]
 
     def _score_tracklets(self, tracklets: list[Tracklet], cum_shift: dict) -> None:
-        """Score by evidence (count × confidence), discounting things that don't move.
+        """Score by evidence density × duration × confidence, discounting things that don't move.
 
-        Motion is the tracklet's *extent* in camera-compensated coordinates,
-        not per-step displacement: detection jitter on a tiny fixture is a
-        few px every step, but it never goes anywhere.
+        Evidence is measured as *coverage* — detections per recorded frame in
+        the tracklet's span — times the span in analysed-frame units, so a
+        stretch sampled at full frame rate by the rim ROI pass does not
+        out-score the sparser main pass by sheer count.  Motion is the
+        tracklet's extent in camera-compensated coordinates, not per-step
+        displacement: jitter on a tiny fixture never goes anywhere.
         """
         full = max(1, self.config.motion_full_span_px)
+        step = self._analysis_step()
+        frame_ids = np.array([f.frame_idx for f in self._frames])
         for t in tracklets:
             xs, ys = [], []
             for d in t.dets:
@@ -431,7 +511,12 @@ class BallTracker:
             t.span_px = max(max(xs) - min(xs), max(ys) - min(ys))
             t.motion_ratio = min(1.0, t.span_px / full)
             mean_conf = float(np.mean([d.confidence for d in t.dets]))
-            t.score = len(t.dets) * mean_conf * (0.25 + 0.75 * t.motion_ratio)
+            lo = int(np.searchsorted(frame_ids, t.start_frame, side="left"))
+            hi = int(np.searchsorted(frame_ids, t.end_frame, side="right"))
+            n_avail = max(1, hi - lo)
+            coverage = min(1.0, len(t.dets) / n_avail)
+            weight = (t.end_frame - t.start_frame) / step + 1.0
+            t.score = coverage * weight * mean_conf * (0.25 + 0.75 * t.motion_ratio)
 
     def _select_chain(self, tracklets: list[Tracklet], cum_shift: dict) -> list[Tracklet]:
         """Dynamic programme: best-scoring chain of time-disjoint tracklets.
@@ -501,10 +586,11 @@ class BallTracker:
         return out
 
     def _analysis_step(self) -> int:
-        """Source frames between consecutive analysed frames (frame_skip)."""
+        """Typical source-frame spacing of the main pass (median gap; ROI frames are denser)."""
         if len(self._frames) < 2:
             return 1
-        return max(1, self._frames[1].frame_idx - self._frames[0].frame_idx)
+        diffs = [b.frame_idx - a.frame_idx for a, b in zip(self._frames, self._frames[1:]) if b.frame_idx > a.frame_idx]
+        return max(1, int(np.median(diffs))) if diffs else 1
 
     # ------------------------------------------------------------------
     # Shot detection
@@ -638,6 +724,52 @@ class BallTracker:
         )
         return shot
 
+    def _player_boxes_by_frame(self) -> dict[int, list[tuple[int, int, int, int]]]:
+        if not hasattr(self, "_boxes_cache") or self._boxes_cache_len != len(self._frames):
+            self._boxes_cache = {f.frame_idx: f.player_boxes for f in self._frames if f.player_boxes}
+            self._boxes_cache_len = len(self._frames)
+        return self._boxes_cache
+
+    def _longest_free_flight_frames(self, positions: list[BallPosition]) -> int | None:
+        """Longest span (source frames) in which detected positions sit outside every player box.
+
+        Returns None when no player boxes were recorded at all (player
+        tracking disabled), so the caller can skip the gate.
+        """
+        boxes_by_frame = self._player_boxes_by_frame()
+        if not boxes_by_frame:
+            return None
+        pad = self.config.free_flight_box_pad
+        head = self.config.free_flight_head_fraction
+        best = 0
+        run_start: int | None = None
+        last_out: int | None = None
+        for p in positions:
+            if p.predicted:
+                continue
+            inside = False
+            for (x1, y1, x2, y2) in boxes_by_frame.get(p.frame_idx, ()):
+                px, py = (x2 - x1) * pad, (y2 - y1) * pad
+                # A ball at or above head height is "free" even if a box
+                # encloses it: close-range shots go up over the defenders,
+                # hand-offs and dribbles stay at chest height.
+                head_line = y1 + (y2 - y1) * head
+                if x1 - px <= p.x <= x2 + px and head_line <= p.y <= y2 + py:
+                    inside = True
+                    break
+            if inside:
+                if run_start is not None and last_out is not None:
+                    best = max(best, last_out - run_start)
+                run_start = None
+                last_out = None
+            else:
+                if run_start is None:
+                    run_start = p.frame_idx
+                last_out = p.frame_idx
+        if run_start is not None and last_out is not None:
+            best = max(best, last_out - run_start)
+        return best
+
     def _rim_entry_verdict(self, last: BallPosition, obs: HoopObservation) -> bool:
         """Made unless the ball is re-detected above the rim shortly after vanishing.
 
@@ -737,6 +869,18 @@ class BallTracker:
                 )
                 return None, arc_end
 
+        # Gate E: free flight.  A shot leaves the shooter's hands and travels
+        # unobstructed; a contested hand-off or a dribble never leaves the
+        # players' boxes.  Skipped when player tracking is off.
+        if cfg.require_free_flight:
+            flight = self._longest_free_flight_frames(positions[arc_start: arc_end + 1])
+            if flight is not None and flight < cfg.min_free_flight_sec * fps:
+                logger.debug(
+                    "Arc rejected (Gate E: free flight): %d frames < %.0f (frames %d-%d)",
+                    flight, cfg.min_free_flight_sec * fps, start_frame, end_frame,
+                )
+                return None, arc_end
+
         # Tighten the event window to shortly before the peak
         peak_frame = positions[peak_idx].frame_idx
         pre_peak_frames = cfg.shot_pre_peak_sec * fps
@@ -764,16 +908,24 @@ class BallTracker:
         made: bool | None = None
         made_via: str | None = None
         hoop_bbox: tuple[int, int, int, int] | None = None
+        speed_ratio: float | None = None
+        fit_rmse: float | None = None
         if rim_entry is not None:
             made = self._rim_entry_verdict(positions[arc_end], rim_entry)
             made_via = "rim_entry" if made else "rim_out"
             hoop_bbox = rim_entry.bbox
         elif sel_obs is not None:
-            made, hoop_bbox = self._check_ball_through_hoop_bbox(made_positions, [sel_obs])
-            made_via = "bbox" if made else None
+            made, made_via, speed_ratio, fit_rmse = self._rim_phase_verdict(
+                positions[arc_start: made_end + 1], made_positions, sel_obs,
+            )
+            hoop_bbox = sel_obs.bbox
+            if made is None:
+                # Reached the rim band and vanished: same rule as a rim entry
+                made = self._rim_entry_verdict(made_positions[-1], sel_obs)
+                made_via = "rim_entry" if made else "rim_out"
             if not made and cfg.use_polygon_zone:
                 if self._check_ball_in_hoop_zone(made_positions, sel_obs):
-                    made, made_via, hoop_bbox = True, "polygon", sel_obs.bbox
+                    made, made_via = True, "polygon"
         elif hoop_pos is not None and not self._hoop_observations:
             # Legacy center-only hoop data
             made = self._check_through_hoop(made_positions, hoop_pos)
@@ -786,6 +938,8 @@ class BallTracker:
             hi = positions[made_end].frame_idx + post_arc_frames
             if any(lo <= f <= hi for f in self._ball_in_basket_frames):
                 made, made_via = True, "ball_in_basket"
+
+        rim_frame = self._first_rim_frame(made_positions, sel_obs if sel_obs is not None else rim_entry)
 
         if made and made_end > arc_end:
             arc_positions = made_positions
@@ -809,8 +963,166 @@ class BallTracker:
             descent_ratio=d_ratio,
             made_via=made_via,
             peak_frame=peak_frame,
+            speed_ratio=speed_ratio,
+            fit_rmse=fit_rmse,
+            rim_frame=rim_frame,
         )
         return shot, arc_end
+
+    # ------------------------------------------------------------------
+    # Made / miss: rim phases
+    # ------------------------------------------------------------------
+
+    def _rim_for_frame(self, frame_idx: int, default: HoopObservation) -> HoopObservation:
+        """Rim observation nearest in time to ``frame_idx`` (camera pans, the rim moves)."""
+        best, best_d = default, abs(default.frame_idx - frame_idx)
+        max_age = self.config.hoop_obs_max_age_frames
+        same_rim_px = 2 * max(1, default.bbox[2] - default.bbox[0])
+        for o in self._hoop_observations:
+            if abs(o.center[0] - default.center[0]) > same_rim_px:
+                continue  # the other basket
+            d = abs(o.frame_idx - frame_idx)
+            if d < best_d and d <= max_age:
+                best, best_d = o, d
+        return best
+
+    def _first_rim_frame(self, positions: list[BallPosition], obs: HoopObservation | None) -> int | None:
+        """First detected position at or below the rim top within the rim span (impact time)."""
+        if obs is None:
+            return None
+        for p in positions:
+            if p.predicted:
+                continue
+            rim = self._rim_for_frame(p.frame_idx, obs)
+            rx1, ry1, rx2, _ = rim.bbox
+            tol = (rx2 - rx1) * self.config.hoop_x_tolerance_ratio
+            if (rx1 - tol) <= p.x <= (rx2 + tol) and p.y >= ry1 - self.config.hoop_entry_y_margin_px:
+                return p.frame_idx
+        return None
+
+    @staticmethod
+    def _fit_parabola(points: list[BallPosition]) -> tuple[float, float, float, float] | None:
+        """Least-squares y = a t² + b t + c over detected points. Returns (a, b, c, rmse)."""
+        pts = [p for p in points if not p.predicted]
+        if len(pts) < 3:
+            return None
+        t0 = pts[0].frame_idx
+        t = np.array([p.frame_idx - t0 for p in pts], dtype=float)
+        y = np.array([p.y for p in pts], dtype=float)
+        a, b, c = np.polyfit(t, y, 2)
+        rmse = float(np.sqrt(np.mean((a * t * t + b * t + c - y) ** 2)))
+        return float(a), float(b), float(c), rmse
+
+    def _rim_phase_verdict(
+        self,
+        flight: list[BallPosition],
+        window: list[BallPosition],
+        obs: HoopObservation,
+    ) -> tuple[bool | None, str, float | None, float | None]:
+        """Classify the descent by the sequence of rim phases it passes through.
+
+        APPROACH: above the rim top, horizontally within the rim span.
+        RIM:      inside the rim band (top − margin … bottom + ½ height).
+        POST:     below the band — inside the net footprint or off to the side.
+
+        Verdicts:
+          approach → post inside the net footprint          → made ("through_net"),
+              unless the ball is still at freefall speed there, which means it
+              passed in front of / behind the rim            → miss ("passed_rim")
+          approach → post outside the net / bounces back up  → miss ("rim_out")
+          approach → rim band, then the track ends           → None (caller applies rim entry)
+          never approached within the rim span               → miss ("short")
+
+        Returns ``(made, via, speed_ratio, fit_rmse)``.
+        """
+        cfg = self.config
+        det = [p for p in window if not p.predicted]
+        if len(det) < 2:
+            return False, "short", None, None
+        peak_i = min(range(len(det)), key=lambda k: det[k].y)
+        descent = det[peak_i:]
+
+        phases: list[tuple[str, BallPosition, HoopObservation]] = []
+        for p in descent:
+            rim = self._rim_for_frame(p.frame_idx, obs)
+            rx1, ry1, rx2, ry2 = rim.bbox
+            rw, rh = max(1, rx2 - rx1), max(1, ry2 - ry1)
+            tol = rw * cfg.hoop_x_tolerance_ratio
+            in_x = (rx1 - tol) <= p.x <= (rx2 + tol)
+            if p.y < ry1 - cfg.hoop_entry_y_margin_px:
+                phases.append(("approach" if in_x else "above_off", p, rim))
+            elif p.y <= ry2 + 0.5 * rh:
+                phases.append(("rim" if in_x else "side", p, rim))
+            else:
+                net_tol = rw * cfg.net_x_tolerance_ratio
+                in_net = (rx1 - net_tol) <= p.x <= (rx2 + net_tol)
+                phases.append(("post_net" if in_net else "post_off", p, rim))
+
+        names = [n for n, _, _ in phases]
+        if "approach" not in names:
+            return False, "short", None, None
+        first_approach = names.index("approach")
+        after = phases[first_approach:]
+        after_names = [n for n, _, _ in after]
+        if not any(n in ("rim", "post_net", "post_off", "side") for n in after_names):
+            return False, "short", None, None  # never came down to the rim
+
+        # The verdict is read from where the ball *ends up*: a rattle that
+        # bounces up and drops back in is a make; one that bounces up and
+        # stays out is a miss.  Stop at the first point clearly below the net
+        # (post_*) — what happens after that is the rebound, not the shot.
+        end_i = next((i for i, n in enumerate(after_names) if n.startswith("post")), len(after) - 1)
+        terminal = after_names[end_i]
+
+        if terminal == "post_off":
+            return False, "rim_out", None, None
+        if terminal == "post_net":
+            flight_det = [p for p in flight if not p.predicted]
+            fit = self._fit_parabola(flight_det)
+            span = float(max(p.y for p in flight_det) - min(p.y for p in flight_det)) if flight_det else 0.0
+            post_pts = [p for n, p, _ in after[end_i:] if n == "post_net"]
+            ratio = self._post_rim_speed_ratio(fit, flight_det[0].frame_idx, span, post_pts) if flight_det else None
+            rmse = fit[3] if fit else None
+            if ratio is not None and ratio > cfg.post_rim_speed_made_max:
+                return False, "passed_rim", ratio, rmse
+            return True, "through_net", ratio, rmse
+        if terminal == "rim":
+            return None, "rim_entry", None, None  # vanished at the rim: caller looks ahead
+        # Ended above the rim band (approach/above_off) or beside it (side)
+        # after touching it: bounced out.
+        return False, "rim_out", None, None
+
+    @staticmethod
+    def _post_rim_speed_ratio(
+        fit: tuple[float, float, float, float] | None,
+        t0: int,
+        flight_span: float,
+        post: list[BallPosition],
+    ) -> float | None:
+        """Measured vertical speed just below the rim / speed a free-falling ball would have.
+
+        A ball that drops through the net is slowed by it (ratio well below 1);
+        a ball that merely passes the rim's image footprint — in front of or
+        behind it — keeps falling at the fitted projectile's speed.  Returns
+        None when there is no trustworthy fit or too few post-rim points.
+        """
+        if fit is None or len(post) < 3:
+            return None
+        a, b, _c, rmse = fit
+        # Only trust a fit that describes a real projectile: constant-speed
+        # (synthetic or badly tracked) motion leaves residuals of ~10% of the
+        # flight; genuine flights at 720p fit to a few px.
+        if a <= 0 or rmse > 0.06 * max(1.0, flight_span):
+            return None
+        p0, p1 = post[0], post[1]
+        dt = p1.frame_idx - p0.frame_idx
+        if dt <= 0:
+            return None
+        measured = (p1.y - p0.y) / dt
+        expected = 2 * a * (p0.frame_idx - t0) + b
+        if measured <= 0 or expected <= 0:
+            return None
+        return float(measured / expected)
 
     def _check_through_hoop(
         self, positions: list[BallPosition], hoop: tuple[int, int]
