@@ -141,20 +141,24 @@ Back at your Resolve workstation, with the same timeline open:
 python -m src.resolve.markers my_game_analysis.json
 ```
 
-This creates color-coded markers on your timeline:
+This creates color-coded markers on your timeline, one per event, spanning the event's duration:
 
-| Marker Color | Event Type |
-|-------------|------------|
-| Blue | Made 2-point shot |
-| Green | Made 3-pointer |
-| Red | Dunk |
-| Yellow | Fast break |
-| Purple | Block / steal |
-| Pink | Buzzer beater |
-| Cyan | Crowd reaction (audio-only detection) |
-| Cream | Shot attempt (missed) |
+| Marker Color | Event Type | Produced by |
+|-------------|------------|-------------|
+| Blue | `made_shot` — ball seen going through the rim | rim-phase verdict |
+| Cream | `shot_attempt` — a miss, or a shot with no rim in view (`made: null`) | rim-phase verdict |
+| Cyan | `crowd_excitement` — audio peak not explained by a shot | crowd energy (game-normalised) |
+| Green | `three_pointer` — made shot from beyond the arc | only with `--court-preset` (experimental) |
+| Red / Yellow / Purple / Pink | dunk, fast break, block/steal, buzzer beater | *reserved — nothing produces these yet* |
 
-Each marker includes a note with the confidence score and detection details. The full event data is stored in the marker's `customData` field for programmatic access.
+The marker **name** is the event label and the **note** is a short readable summary, e.g.
+`Made Shot 97% · through net · 20 ft two · rim impact (audio) · C20260912_6415` or
+`Shot Attempt 88% · rim out · C20260912_6416` or `Crowd Reaction 92% · 4.5 s`.
+The full event (confidences, `made_via`, speed ratio, fit residual, source file, …) is
+stored in the marker's `customData` as JSON.
+
+Resolve allows one marker per frame; if two events start on the same frame the
+second is moved forward by up to 5 frames (shots keep their frame, crowd events move).
 
 Options:
 
@@ -162,7 +166,11 @@ Options:
 # Clear old markers before importing
 python -m src.resolve.markers --clear my_game_analysis.json
 
-# Only import high-confidence events
+# Crowd reactions are far more numerous than shots — they have their own floor
+# (default 0.85); 0 imports them all, 1.1 imports none
+python -m src.resolve.markers --crowd-min-confidence 0.9 my_game_analysis.json
+
+# Global floor for every marker type
 python -m src.resolve.markers --min-confidence 0.8 my_game_analysis.json
 ```
 
@@ -276,6 +284,7 @@ Positional:
 Options:
   --clear                  Remove all existing markers before importing
   --min-confidence FLOAT   Only import events above this confidence (default: 0.0)
+  --crowd-min-confidence F Separate floor for crowd-reaction markers (default: 0.85)
   -v, --verbose            Enable debug logging
 ```
 
