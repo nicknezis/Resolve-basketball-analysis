@@ -35,11 +35,125 @@ def load_analysis(json_path: Path) -> dict:
     with open(json_path) as f:
         return json.load(f)
 
+# Human phrasing for how a shot verdict was reached
+_VIA_PHRASE = {
+    "through_net": "through net",
+    "rim_entry": "into net",
+    "ball_in_basket": "ball in basket",
+    "polygon": "in net zone",
+    "proximity": "near rim",
+    "rim_out": "rim out",
+    "passed_rim": "missed, passed rim",
+    "short": "did not reach rim",
+}
+
+
+def marker_note(event: dict) -> str:
+    """Short, readable marker note; the full event stays in customData.
+
+    Examples: ``Made Shot 97% · through net · 20 ft two · rim impact · C20260912_6415``
+    ``Shot Attempt 88% · rim out · C20260912_6416``  ``Crowd Reaction 92% · 4.5 s``
+    """
+    event_type = event.get("type", "unknown")
+    label = EVENT_LABELS.get(event_type, event_type.replace("_", " ").title())
+    conf = event.get("confidence", 0.0)
+    d = event.get("details", {}) or {}
+    parts = [f"{label} {conf:.0%}"]
+
+    if event_type in ("made_shot", "shot_attempt", "three_pointer"):
+        via = d.get("made_via")
+        if via:
+            parts.append(_VIA_PHRASE.get(via, via.replace("_", " ")))
+        elif d.get("made") is None:
+            parts.append("no rim in view")
+        if d.get("shot_distance_ft") is not None:
+            zone = d.get("shot_zone") or ""
+            parts.append(f"{d['shot_distance_ft']:.0f} ft {zone}".strip())
+        if d.get("rim_impact") is not None:
+            parts.append("rim impact (audio)")
+    elif event_type == "crowd_excitement":
+        dur = float(event.get("end_sec", 0.0)) - float(event.get("start_sec", 0.0))
+        if dur > 0:
+            parts.append(f"{dur:.1f} s")
+
+    clip = d.get("source_clip")
+    if clip:
+        parts.append(Path(str(clip)).stem)
+    return " · ".join(parts)
+
+
+def event_passes(event: dict, min_confidence: float, crowd_min_confidence: float) -> bool:
+    """Per-type confidence gate: crowd reactions get their own, usually stricter, floor."""
+    conf = float(event.get("confidence", 0.0))
+    if event.get("type") == "crowd_excitement":
+        return conf >= max(min_confidence, crowd_min_confidence)
+    return conf >= min_confidence
+
+
+def plan_markers(
+    events: list[dict],
+    timeline_fps: float,
+    source_fps: float,
+    min_confidence: float = 0.0,
+    crowd_min_confidence: float = 0.0,
+    max_nudge_frames: int = 5,
+) -> tuple[list[dict], dict[str, int]]:
+    """Turn events into marker specs, resolving Resolve's one-marker-per-frame rule.
+
+    Returns ``(markers, skipped_by_type)``.  Each marker dict has
+    ``frame, duration, color, name, note, custom_data`` and, when its start
+    had to move off an occupied frame, ``nudged_from``.
+    """
+    ratio = timeline_fps / source_fps if abs(source_fps - timeline_fps) > 0.1 and source_fps > 0 else 1.0
+    used: set[int] = set()
+    markers: list[dict] = []
+    skipped: dict[str, int] = {}
+
+    # Shots first so a crowd event never bumps a shot off its frame
+    order = sorted(events, key=lambda e: (e.get("type") == "crowd_excitement", e.get("start_frame", 0)))
+    for event in order:
+        event_type = event.get("type", "unknown")
+        if not event_passes(event, min_confidence, crowd_min_confidence):
+            skipped[event_type] = skipped.get(event_type, 0) + 1
+            continue
+        start = int(event.get("start_frame", 0) * ratio)
+        end = int(event.get("end_frame", start) * ratio)
+        frame = start
+        while frame in used and frame - start < max_nudge_frames:
+            frame += 1
+        if frame in used:
+            logger.warning("No free frame near %d for a %s marker; skipping", start, event_type)
+            skipped[event_type] = skipped.get(event_type, 0) + 1
+            continue
+        used.add(frame)
+        spec = {
+            "frame": frame,
+            "duration": max(1, end - frame),
+            "color": MARKER_COLORS.get(event_type, "Cyan"),
+            "name": EVENT_LABELS.get(event_type, event_type.replace("_", " ").title()),
+            "note": marker_note(event),
+            "custom_data": json.dumps({
+                "type": event_type,
+                "confidence": event.get("confidence", 0),
+                "video_confidence": event.get("video_confidence", 0),
+                "audio_confidence": event.get("audio_confidence", 0),
+                "start_frame": event.get("start_frame"),
+                "end_frame": event.get("end_frame"),
+                "details": event.get("details", {}),
+            }),
+        }
+        if frame != start:
+            spec["nudged_from"] = start
+        markers.append(spec)
+    markers.sort(key=lambda m: m["frame"])
+    return markers, skipped
+
 
 def import_markers(
     json_path: Path,
     clear_existing: bool = False,
     min_confidence: float = 0.0,
+    crowd_min_confidence: float = 0.85,
 ) -> dict:
     """Import analysis JSON as markers on the active Resolve timeline.
 
@@ -47,6 +161,8 @@ def import_markers(
         json_path: Path to the analysis JSON file.
         clear_existing: If True, remove existing markers before adding new ones.
         min_confidence: Only import events with confidence >= this value.
+        crowd_min_confidence: Separate floor for crowd-reaction markers, which
+            are far more numerous than shots.
 
     Returns:
         Summary dict with counts of imported markers.
@@ -94,68 +210,35 @@ def import_markers(
     if clear_existing:
         _clear_markers(timeline)
 
-    # Add markers for each event
+    markers, skipped_by_type = plan_markers(
+        events, timeline_fps, source_fps,
+        min_confidence=min_confidence, crowd_min_confidence=crowd_min_confidence,
+    )
+
     imported = 0
-    skipped = 0
-    for event in events:
-        confidence = event.get("confidence", 0)
-        if confidence < min_confidence:
-            skipped += 1
-            continue
-
-        event_type = event.get("type", "unknown")
-        start_frame = event.get("start_frame", 0)
-        end_frame = event.get("end_frame", start_frame)
-
-        # Adjust frame numbers if source and timeline FPS differ
-        if abs(source_fps - timeline_fps) > 0.1:
-            ratio = timeline_fps / source_fps
-            start_frame = int(start_frame * ratio)
-            end_frame = int(end_frame * ratio)
-
-        duration = max(1, end_frame - start_frame)
-        color = MARKER_COLORS.get(event_type, "Cyan")
-        label = EVENT_LABELS.get(event_type, event_type.replace("_", " ").title())
-
-        note = f"{label} (confidence: {confidence:.0%})"
-        details = event.get("details", {})
-        if details:
-            detail_parts = [f"{k}: {v}" for k, v in details.items()]
-            note += " | " + ", ".join(detail_parts)
-
-        # Store full event data in customData for potential later use
-        custom_data = json.dumps({
-            "type": event_type,
-            "confidence": confidence,
-            "video_confidence": event.get("video_confidence", 0),
-            "audio_confidence": event.get("audio_confidence", 0),
-            "details": details,
-        })
-
-        success = timeline.AddMarker(
-            start_frame,
-            color,
-            label,
-            note,
-            duration,
-            custom_data,
-        )
-
-        if success:
+    failed = 0
+    for m in markers:
+        if "nudged_from" in m:
+            logger.info("Marker at frame %d moved to %d (frame already had a marker)", m["nudged_from"], m["frame"])
+        if timeline.AddMarker(m["frame"], m["color"], m["name"], m["note"], m["duration"], m["custom_data"]):
             imported += 1
-            logger.debug("Added %s marker at frame %d", color, start_frame)
+            logger.debug("Added %s marker at frame %d: %s", m["color"], m["frame"], m["note"])
         else:
-            logger.warning("Failed to add marker at frame %d", start_frame)
+            failed += 1
+            logger.warning("Failed to add %s marker at frame %d", m["color"], m["frame"])
 
+    skipped = sum(skipped_by_type.values())
     summary = {
         "timeline": timeline_name,
         "imported": imported,
+        "failed": failed,
         "skipped": skipped,
+        "skipped_by_type": skipped_by_type,
         "total_events": len(events),
     }
     logger.info(
-        "Imported %d markers (%d skipped) onto timeline '%s'",
-        imported, skipped, timeline_name,
+        "Imported %d markers (%d skipped, %d failed) onto timeline '%s'",
+        imported, skipped, failed, timeline_name,
     )
     return summary
 
@@ -194,7 +277,15 @@ def main() -> int:
         "--min-confidence",
         type=float,
         default=0.0,
-        help="Minimum confidence threshold for import (default: 0.0, import all)",
+        help="Minimum confidence for any marker (default: 0.0 — the analysis already "
+        "filtered shots at its own threshold)",
+    )
+    parser.add_argument(
+        "--crowd-min-confidence",
+        type=float,
+        default=0.85,
+        help="Minimum confidence for crowd-reaction markers (default: 0.85). They are "
+        "far more numerous than shots; raise to thin them, 0 to import all.",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -217,6 +308,7 @@ def main() -> int:
         args.json_file,
         clear_existing=args.clear,
         min_confidence=args.min_confidence,
+        crowd_min_confidence=args.crowd_min_confidence,
     )
 
     if "error" in result:
@@ -225,7 +317,10 @@ def main() -> int:
 
     print(f"Imported {result['imported']} markers onto timeline '{result['timeline']}'")
     if result["skipped"]:
-        print(f"Skipped {result['skipped']} events below confidence threshold")
+        by_type = ", ".join(f"{k}: {v}" for k, v in sorted(result["skipped_by_type"].items()))
+        print(f"Skipped {result['skipped']} events below the confidence thresholds ({by_type})")
+    if result.get("failed"):
+        print(f"Resolve rejected {result['failed']} markers (see log)")
 
     return 0
 
